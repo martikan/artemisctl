@@ -9,6 +9,11 @@ consume messages from TestUser queue:
 artemisctl -u artemis -p artemis -q TestUser
 ```
 
+consume messages using different broker instead of localhost one:
+```shell
+artemisctl -b internal.demo.artemis:30202 -u artemis -p artemis -q TestUser
+```
+
 ---
 
 produce plain text messages to TestUser queue:
