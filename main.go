@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/go-stomp/stomp"
 	"github.com/google/uuid"
@@ -35,6 +36,7 @@ var (
 	method     string
 	messages   collectionVar
 	bodyType   string
+	filePath   string
 	helpFlag   = false
 
 	closing = make(chan struct{})
@@ -48,6 +50,7 @@ func init() {
 	flag.StringVar(&method, "m", "C", "Method type. 'C' is consuming, 'P' is producing")
 	flag.Var(&messages, "message", "Message to send")
 	flag.StringVar(&bodyType, "t", "plain", "Type of message body. 'plain'=text/plain, 'json'=application/json")
+	flag.StringVar(&filePath, "f", "", "Given file name to save data")
 	flag.BoolVar(&helpFlag, "help", false, "Print help text")
 	flag.Parse()
 
@@ -110,6 +113,14 @@ func consumeMessages(conn *stomp.Conn, wg *sync.WaitGroup) {
 
 	var counter atomic.Int32
 
+	intoFile := filePath != ""
+
+	var file *os.File
+	defer file.Close()
+	if intoFile {
+		file = createFile(filePath)
+	}
+
 	sub, err := conn.Subscribe(queueName, stomp.AckClientIndividual)
 	if err != nil {
 		log.Fatalf("cannot subscribe to %s: %v\n", queueName, err)
@@ -117,6 +128,8 @@ func consumeMessages(conn *stomp.Conn, wg *sync.WaitGroup) {
 	defer sub.Unsubscribe()
 
 	log.Println("Waiting for messages...")
+
+	lastMessageTime := time.Now()
 
 loop:
 	for {
@@ -129,8 +142,29 @@ loop:
 				break loop
 			}
 
-			fmt.Println(string(msg.Body))
+			lastMessageTime = time.Now()
+
+			if intoFile {
+				_, err := file.WriteString(string(msg.Body) + "\n")
+				if err != nil {
+					log.Printf("Failed to write message to file: %v\n", err)
+				}
+			} else {
+				fmt.Println(string(msg.Body))
+			}
+
 			counter.Add(1)
+
+			if intoFile && counter.Load()%1000 == 0 {
+				fmt.Printf("%d messages processed so far...\n", counter.Load())
+			}
+		case <-time.After(5 * time.Second):
+			// Check if no message has been consumed for the last 5 seconds
+			// Only do echo if writing into file.
+			if intoFile && time.Since(lastMessageTime) > 5*time.Second {
+				log.Println("Waiting for messages...")
+				lastMessageTime = time.Now()
+			}
 		}
 	}
 
@@ -190,4 +224,14 @@ func sendMessages(conn *stomp.Conn, wg *sync.WaitGroup) {
 	}
 
 	log.Println("Finished sending messages! Total sent: ", counter.Load())
+}
+
+func createFile(path string) *os.File {
+	// Open the file to write messages
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Fatalf("Failed to open file for writing: %v\n", err)
+	}
+
+	return file
 }
