@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -28,16 +29,30 @@ func (c *collectionVar) Set(value string) error {
 	return nil
 }
 
+const (
+	aqMsgTimestamp = "timestamp"
+	aqMsgID        = "messageID"
+	aqMsgTraceID   = "TRACE_ID"
+	aqMsgSCS       = "SCS"
+)
+
 var (
-	serverAddr string
-	serverUser string
-	serverPass string
-	queueName  string
-	method     string
-	messages   collectionVar
-	bodyType   string
-	filePath   string
-	helpFlag   = false
+	serverAddr   string
+	serverUser   string
+	serverPass   string
+	queueName    string
+	method       string
+	messages     collectionVar
+	bodyType     string
+	filePath     string
+	msgTraceID   string
+	msgID        string
+	apiName      string
+	startTime    time.Time
+	startTimeStr string
+	endTime      time.Time
+	endTimeStr   string
+	helpFlag     = false
 
 	closing = make(chan struct{})
 )
@@ -48,11 +63,18 @@ func init() {
 	flag.StringVar(&serverPass, "p", "", "password")
 	flag.StringVar(&queueName, "q", "", "Destination queue")
 	flag.StringVar(&method, "m", "C", "Method type. 'C' is consuming, 'P' is producing")
+	flag.StringVar(&msgTraceID, "trace-id", "", "Filter for trace id")
+	flag.StringVar(&msgID, "message-id", "", "Filter for message id")
+	flag.StringVar(&apiName, "api", "", "Filter for api name")
+	flag.StringVar(&startTimeStr, "startdate", "", "start time for filtering messages in RFC3339 format. e.g.: 2024-01-01T15:05:05Z")
+	flag.StringVar(&endTimeStr, "enddate", "", "end time for filtering messages in RFC3339 format. e.g.: 2024-01-01T15:05:05Z")
 	flag.Var(&messages, "message", "Message to send")
 	flag.StringVar(&bodyType, "t", "plain", "Type of message body. 'plain'=text/plain, 'json'=application/json")
 	flag.StringVar(&filePath, "f", "", "Given file name to save data")
 	flag.BoolVar(&helpFlag, "help", false, "Print help text")
 	flag.Parse()
+
+	var err error
 
 	if helpFlag || len(os.Args) == 1 {
 		fmt.Fprintf(os.Stderr, "Usage of %s\n", os.Args[0])
@@ -70,6 +92,20 @@ func init() {
 
 	if queueName == "" {
 		log.Fatalln("queue must be provided!")
+	}
+
+	if startTimeStr != "" {
+		startTime, err = time.Parse(time.RFC3339, startTimeStr)
+		if err != nil {
+			log.Fatalf("Invalid start time format: %v\n", err)
+		}
+	}
+
+	if endTimeStr != "" {
+		endTime, err = time.Parse(time.RFC3339, endTimeStr)
+		if err != nil {
+			log.Fatalf("Invalid end time format: %v\n", err)
+		}
 	}
 
 }
@@ -121,7 +157,7 @@ func consumeMessages(conn *stomp.Conn, wg *sync.WaitGroup) {
 		file = createFile(filePath)
 	}
 
-	sub, err := conn.Subscribe(queueName, stomp.AckClientIndividual)
+	sub, err := conn.Subscribe(queueName, stomp.AckClientIndividual, stomp.SubscribeOpt.Header("consumer-window-size", "-1"))
 	if err != nil {
 		log.Fatalf("cannot subscribe to %s: %v\n", queueName, err)
 	}
@@ -137,9 +173,21 @@ loop:
 		case <-closing:
 			break loop
 		case msg := <-sub.C:
+			counter.Add(1)
+
+			if msg.Err != nil {
+				log.Println("Error during consuming messages:", msg.Err.Error())
+				continue
+			}
+
 			if msg == nil {
 				fmt.Println("Subscription is already closed.")
 				break loop
+			}
+
+			// Filtering messages.
+			if skipMessage(msg) {
+				continue
 			}
 
 			lastMessageTime = time.Now()
@@ -150,10 +198,8 @@ loop:
 					log.Printf("Failed to write message to file: %v\n", err)
 				}
 			} else {
-				fmt.Println(string(msg.Body))
+				fmt.Printf("%s - %s\n", msg.Header.Get(aqMsgTraceID), string(msg.Body))
 			}
-
-			counter.Add(1)
 
 			if intoFile && counter.Load()%1000 == 0 {
 				fmt.Printf("%d messages processed so far...\n", counter.Load())
@@ -169,6 +215,84 @@ loop:
 	}
 
 	log.Println("Finished consuming the messages! Total messages: ", counter.Load())
+}
+
+// skipMessage is a filter.
+// If a given filter is not equal with the actual value,
+// then the message will be skipped.
+func skipMessage(msg *stomp.Message) bool {
+
+	// Date interval filter
+	if !startTime.IsZero() || !endTime.IsZero() {
+		timestampStr := msg.Header.Get(aqMsgTimestamp)
+		if timestampStr != "" {
+			timeMillis, err := strconv.ParseInt(timestampStr, 10, 64)
+			if err != nil {
+				log.Printf("id:%s - invalid timestamp header\n", msg.Header.Get(aqMsgID))
+				return true
+			}
+
+			// If start time is bigger then the actual timestamp then,
+			// skip the message.
+			if !startTime.IsZero() {
+				if timeMillis < startTime.UnixMilli() {
+					return true
+				}
+			}
+
+			// If the end time is lower the the actual timestamp then,
+			// skip the message.
+			if !endTime.IsZero() {
+				if timeMillis > endTime.UnixMilli() {
+					return true
+				}
+			}
+
+		} else {
+			log.Printf("id:%s - timestamp has been not found in header!\n", msg.Header.Get(aqMsgID))
+			return true
+		}
+	}
+
+	// Trace ID filter
+	if msgTraceID != "" {
+		id := msg.Header.Get(aqMsgTraceID)
+		if msgTraceID == "" {
+			log.Printf("id:%s - %s property is missing\n", aqMsgTraceID, msg.Header.Get(aqMsgTraceID))
+			return true
+		}
+
+		if msgTraceID != id {
+			return true
+		}
+	}
+
+	// Message ID filter
+	if msgID != "" {
+		id := msg.Header.Get(aqMsgID)
+		if msgID == "" {
+			log.Printf("id:%s - %s property is missing\n", aqMsgTraceID, msg.Header.Get(aqMsgID))
+			return true
+		}
+
+		if msgID != id {
+			return true
+		}
+	}
+	// API name filter
+	if apiName != "" {
+		msgAPI := msg.Header.Get(aqMsgSCS)
+		if msgAPI == "" {
+			log.Printf("id:%s - %s property is missing\n", aqMsgSCS, msg.Header.Get(aqMsgSCS))
+			return true
+		}
+
+		if msgAPI != apiName {
+			return true
+		}
+	}
+
+	return false
 }
 
 func sendMessages(conn *stomp.Conn, wg *sync.WaitGroup) {
