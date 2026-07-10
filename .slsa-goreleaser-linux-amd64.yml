@@ -1,0 +1,13 @@
+version: 1
+
+env:
+  - GO111MODULE=on
+  - CGO_ENABLED=0
+  - GOAMD64=v3
+goos: linux
+goarch: amd64
+main: ./cmd/artemisctl
+binary: artemisctl-linux-x64
+
+ldflags:
+  - "-s -w -X main.Version={{ .Env.VERSION }}"

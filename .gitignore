@@ -28,3 +28,9 @@ go.work.sum
 .env
 
 bin/
+
+# Subagent-driven-development scratch ledger
+.superpowers/
+
+# Superpowers plan/spec scaffolding (design docs live in docs/design/)
+docs/superpowers/

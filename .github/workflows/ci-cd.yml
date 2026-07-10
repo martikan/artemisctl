@@ -1,0 +1,101 @@
+name: Go secure Build and Deploy
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions: read-all
+
+jobs:
+  # ==========================================
+  # INIT (It generates the ldflags for build)
+  # ==========================================
+  init:
+    runs-on: ubuntu-latest
+    outputs:
+      commit-date: ${{ steps.ldflags.outputs.commit-date }}
+      commit: ${{ steps.ldflags.outputs.commit }}
+      version: ${{ steps.ldflags.outputs.version }}
+      tree-state: ${{ steps.ldflags.outputs.tree-state }}
+      go-version: ${{ steps.go-version.outputs.go-version }}
+    steps:
+      - id: checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: go-version
+        run: echo "go-version=$(grep '^go ' go.mod | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+      - id: ldflags
+        run: |
+          echo "commit-date=$(git log --date=iso8601-strict -1 --pretty=%ct)" >> "$GITHUB_OUTPUT"
+          echo "commit=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+          echo "version=$(git describe --tags --always --dirty | cut -c2-)" >> "$GITHUB_OUTPUT"
+          echo "tree-state=$(if git diff --quiet; then echo "clean"; else echo "dirty"; fi)" >> "$GITHUB_OUTPUT"
+
+  # ==========================================
+  # SECURE SLSA BUILD (Runs ONLY on Tags)
+  # ==========================================
+  slsa-build:
+    needs:
+      - init
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      id-token: write
+      contents: write
+      actions: read
+    strategy:
+      matrix:
+        os:
+          - linux
+          - darwin
+        arch:
+          - amd64
+          - arm64
+    uses: slsa-framework/slsa-github-generator/.github/workflows/builder_go_slsa3.yml@v2.1.0
+    with:
+        go-version: ${{ needs.init.outputs.go-version }}
+        config-file: .slsa-goreleaser-${{matrix.os}}-${{matrix.arch}}.yml
+        evaluated-envs: "COMMIT_DATE:${{needs.init.outputs.commit-date}}, COMMIT:${{needs.init.outputs.commit}}, VERSION:${{needs.init.outputs.version}}, TREE_STATE:${{needs.init.outputs.tree-state}}"
+        # This uploads the secure raw binaries AND the .intoto.jsonl receipt to the GitHub Release
+        upload-assets: true
+        private-repository: true
+
+  # ==========================================
+  # DOCKER DEPLOY (Runs ONLY on Tags)
+  # ==========================================
+  docker-deploy:
+    needs: [slsa-build]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+      contents: read
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Download Secure Linux Binary
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Only download the Linux AMD64 binary for the Docker image
+          gh release download ${{ github.ref_name }} --pattern "artemisctl-linux-x64"
+          mv artemisctl-linux-x64 artemisctl
+          chmod +x artemisctl
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/martikan/artemisctl:${{ github.ref_name }}
+            ghcr.io/martikan/artemisctl:latest
