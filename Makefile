@@ -7,7 +7,10 @@ COVERAGE_FILE=coverage.out
 # Linker flags to strip debug information
 LDFLAGS=-ldflags="-s -w"
 
-.PHONY: all build clean test coverage release help
+.PHONY: all build clean test coverage release help it-clean
+
+# Name of the shared, reused integration-test broker container.
+IT_BROKER=artemisctl-it-broker
 
 # Default target when you just type 'make'
 all: clean test build
@@ -26,12 +29,12 @@ test:
 	@echo "==> Running go vet..."
 	go vet ./...
 	@echo "==> Running tests..."
-	go test -v ./internal/...
+	go test -v -p 1 ./internal/...
 
 ## coverage: Run tests with coverage for CI
 coverage-ci:
 	@echo "==> Running tests with coverage..."
-	go test -covermode=atomic -race -coverprofile=$(COVERAGE_FILE) ./internal/...
+	go test -covermode=atomic -race -p 1 -coverprofile=$(COVERAGE_FILE) ./internal/...
 	@echo "==> Done."
 
 ## coverage: Run tests with coverage and generate an HTML report
@@ -59,6 +62,15 @@ clean:
 	@echo "==> go mod tidy to clean up go.mod and go.sum..."
 	@go mod tidy
 
+## it-clean: Remove the shared integration-test broker container
+# Integration tests reuse one broker (Reuse: true) and never terminate it, and
+# Ryuk cannot reap reused containers (and is disabled under rootless podman), so
+# the broker lingers on purpose. Run this to force-remove it.
+it-clean:
+	@echo "==> Removing shared integration broker $(IT_BROKER)..."
+	@docker rm -f $(IT_BROKER) 2>/dev/null || true
+	@echo "==> Done."
+
 ## help: Show this help message
 help:
 	@echo "Usage: make <target>"
@@ -68,4 +80,5 @@ help:
 	@echo "  test     - Run all tests"
 	@echo "  coverage - Run tests with coverage and generate an HTML report"
 	@echo "  release  - Cross-compile the CLI for Linux, macOS, and Windows"
+	@echo "  it-clean - Remove the shared integration-test broker container"
 	@echo "  clean    - Remove build artifacts"

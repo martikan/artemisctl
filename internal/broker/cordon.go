@@ -29,6 +29,10 @@ const (
 	cordonRejectThreshold = 100
 )
 
+// uncordonPageSizeBytes is Artemis's default page size, restored by
+// UncordonRemove when it resets the wildcard match to a permissive policy.
+const uncordonPageSizeBytes = 10485760
+
 // ErrBrokerTooOld is returned by Cordon when the broker does not expose the
 // two-argument addAddressSettings(String,String) JSON overload over the AMQP
 // management address. On such brokers (e.g. 2.31.x) the setting can only be
@@ -71,12 +75,19 @@ func (c *Client) applyAddressSettings(ctx context.Context, match, settingsJSON s
 		return fmt.Errorf("marshal addAddressSettings args: %w", err)
 	}
 	if _, err := c.callManagement(ctx, "broker", "addAddressSettings", string(body)); err != nil {
-		if strings.Contains(err.Error(), "no operation addAddressSettings") {
-			return ErrBrokerTooOld
-		}
-		return err
+		return asBrokerTooOld(err)
 	}
 	return nil
+}
+
+// asBrokerTooOld maps the broker's "no operation addAddressSettings" rejection
+// (returned by brokers without the two-arg JSON overload, e.g. 2.31.x) to the
+// clearer ErrBrokerTooOld, and passes any other error through unchanged.
+func asBrokerTooOld(err error) error {
+	if err != nil && strings.Contains(err.Error(), "no operation addAddressSettings") {
+		return ErrBrokerTooOld
+	}
+	return err
 }
 
 // withCordonPolicy returns the given settings object with only the address-full
@@ -94,6 +105,28 @@ func withCordonPolicy(settingsJSON string) (string, error) {
 	out, err := json.Marshal(m)
 	if err != nil {
 		return "", fmt.Errorf("marshal cordon settings: %w", err)
+	}
+	return string(out), nil
+}
+
+// withUncordonPolicy reverses exactly the fields withCordonPolicy overrides,
+// resetting the address-full policy and size thresholds to permissive values
+// while preserving every other field. It is how UncordonRemove lifts a cordon
+// when no saved pre-cordon state is available: on Artemis 2.42
+// removeAddressSettings does not reliably clear the wildcard override, so we
+// overwrite it with a permissive policy instead.
+func withUncordonPolicy(settingsJSON string) (string, error) {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(settingsJSON), &m); err != nil {
+		return "", fmt.Errorf("parse settings object: %w", err)
+	}
+	m["addressFullMessagePolicy"] = json.RawMessage(`"PAGE"`)
+	m["maxSizeBytes"] = json.RawMessage("-1")
+	m["pageSizeBytes"] = json.RawMessage(fmt.Sprintf("%d", uncordonPageSizeBytes))
+	m["maxSizeBytesRejectThreshold"] = json.RawMessage("-1")
+	out, err := json.Marshal(m)
+	if err != nil {
+		return "", fmt.Errorf("marshal uncordon settings: %w", err)
 	}
 	return string(out), nil
 }
@@ -124,12 +157,20 @@ func (c *Client) Uncordon(ctx context.Context, savedSettings string) error {
 	return c.applyAddressSettings(ctx, wildcardMatch, savedSettings)
 }
 
-// UncordonRemove lifts the cordon by removing the wildcard settings entry
-// entirely. It is the fallback for when no saved pre-cordon state is available;
-// it reverts to the broker's configured defaults and will drop any wildcard
-// entry that pre-existed the cordon.
+// UncordonRemove lifts the cordon when no saved pre-cordon state is available.
+// It cannot use removeAddressSettings: on Artemis 2.42 that reports success but
+// leaves the wildcard override in place (a no-op), so the cordon never lifts.
+// Instead it reads the current wildcard settings and overwrites only the
+// address-full policy and size thresholds back to permissive values, undoing
+// exactly what Cordon applied while preserving every other field.
 func (c *Client) UncordonRemove(ctx context.Context) error {
-	body := fmt.Sprintf(`[%q]`, wildcardMatch)
-	_, err := c.callManagement(ctx, "broker", "removeAddressSettings", body)
-	return err
+	current, err := c.getWildcardSettings(ctx)
+	if err != nil {
+		return err
+	}
+	permissive, err := withUncordonPolicy(current)
+	if err != nil {
+		return err
+	}
+	return c.applyAddressSettings(ctx, wildcardMatch, permissive)
 }

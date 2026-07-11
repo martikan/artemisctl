@@ -8,7 +8,9 @@ import (
 	"time"
 
 	"github.com/Azure/go-amqp"
-	"github.com/testcontainers/testcontainers-go/modules/artemis"
+
+	"github.com/martikan/artemisctl/internal/brokertest"
+	"github.com/martikan/artemisctl/internal/store"
 )
 
 // sendTestMessages sends the given bodies to the named queue over the
@@ -37,21 +39,48 @@ func sendTestMessages(ctx context.Context, c *Client, queue string, bodies []str
 	return nil
 }
 
-// startArtemis boots a broker container and returns connection props + cleanup.
-// Takes testing.TB so both tests and benchmarks can use it.
+// startArtemis returns connection props for the shared integration broker,
+// resetting it to a clean slate first. Takes testing.TB so both tests and
+// benchmarks can use it.
 func startArtemis(t testing.TB) ConnectionProps {
 	t.Helper()
-	ctx := context.Background()
-	ctr, err := artemis.Run(ctx, "apache/activemq-artemis:2.31.2")
+	sc := brokertest.Shared(t)
+	props := ConnectionProps{URL: sc.URL, Username: sc.Username, Password: sc.Password}
+	resetBroker(t, props)
+	return props
+}
+
+// discardSink drops every drained record; used only to purge queues.
+type discardSink struct{}
+
+func (discardSink) Append(store.Record) error { return nil }
+func (discardSink) Sync() error               { return nil }
+
+// resetBroker returns the shared, reused broker to a clean slate so each test
+// starts fresh despite dirty-context reuse: it lifts any wildcard cordon a
+// crashed cordon test may have left (which would otherwise reject the next
+// test's producers), then drains every user queue empty.
+func resetBroker(t testing.TB, props ConnectionProps) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	c, err := Connect(ctx, props)
 	if err != nil {
-		t.Fatalf("start artemis: %v", err)
+		t.Fatalf("reset connect: %v", err)
 	}
-	t.Cleanup(func() { _ = ctr.Terminate(ctx) })
-	host, err := ctr.BrokerEndpoint(ctx)
+	defer c.Close(ctx)
+	// Lift any leftover cordon by overwriting the wildcard with permissive
+	// settings. removeAddressSettings("#") does not reliably clear it on 2.42.
+	_ = c.Uncordon(ctx, brokertest.PermissiveWildcardSettings)
+	qs, err := c.ListQueues(ctx)
 	if err != nil {
-		t.Fatalf("endpoint: %v", err)
+		t.Fatalf("reset list queues: %v", err)
 	}
-	return ConnectionProps{URL: host, Username: ctr.User(), Password: ctr.Password()}
+	for _, q := range qs {
+		if _, err := c.DrainQueue(ctx, q.Name, discardSink{}, 500*time.Millisecond, 200); err != nil {
+			t.Fatalf("reset drain %s: %v", q.Name, err)
+		}
+	}
 }
 
 func TestListQueuesIntegration(t *testing.T) {

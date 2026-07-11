@@ -5,28 +5,52 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/Azure/go-amqp"
 	"github.com/martikan/artemisctl/internal/broker"
-	"github.com/testcontainers/testcontainers-go/modules/artemis"
+	"github.com/martikan/artemisctl/internal/brokertest"
+	"github.com/martikan/artemisctl/internal/store"
 )
 
-// startArtemisForCLI boots a broker container and returns connection props.
-// It is a cli-package-local copy of the broker package's startArtemis helper
-// (test-only symbols cannot be shared across packages).
+// startArtemisForCLI returns connection props for the shared integration broker,
+// resetting it to a clean slate first.
 func startArtemisForCLI(t *testing.T) broker.ConnectionProps {
 	t.Helper()
-	ctx := context.Background()
-	ctr, err := artemis.Run(ctx, "apache/activemq-artemis:2.31.2")
+	sc := brokertest.Shared(t)
+	props := broker.ConnectionProps{URL: sc.URL, Username: sc.Username, Password: sc.Password}
+	resetBrokerForCLI(t, props)
+	return props
+}
+
+// discardSink drops every drained record; used only to purge queues.
+type discardSink struct{}
+
+func (discardSink) Append(store.Record) error { return nil }
+func (discardSink) Sync() error               { return nil }
+
+// resetBrokerForCLI empties the shared broker before a CLI integration test,
+// mirroring the broker package's resetBroker over the exported client API.
+func resetBrokerForCLI(t *testing.T, props broker.ConnectionProps) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	c, err := broker.Connect(ctx, props)
 	if err != nil {
-		t.Fatalf("start artemis: %v", err)
+		t.Fatalf("reset connect: %v", err)
 	}
-	t.Cleanup(func() { _ = ctr.Terminate(ctx) })
-	host, err := ctr.BrokerEndpoint(ctx)
+	defer c.Close(ctx)
+	// Lift any leftover cordon (see resetBroker in the broker package).
+	_ = c.Uncordon(ctx, brokertest.PermissiveWildcardSettings)
+	qs, err := c.ListQueues(ctx)
 	if err != nil {
-		t.Fatalf("endpoint: %v", err)
+		t.Fatalf("reset list queues: %v", err)
 	}
-	return broker.ConnectionProps{URL: host, Username: ctr.User(), Password: ctr.Password()}
+	for _, q := range qs {
+		if _, err := c.DrainQueue(ctx, q.Name, discardSink{}, 500*time.Millisecond, 200); err != nil {
+			t.Fatalf("reset drain %s: %v", q.Name, err)
+		}
+	}
 }
 
 // seedQueue sends bodies to queue over a standalone AMQP connection.

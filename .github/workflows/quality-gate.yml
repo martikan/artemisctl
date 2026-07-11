@@ -45,7 +45,6 @@ jobs:
     needs: [lint]
     permissions:
       contents: read
-      packages: read
       pull-requests: write
     steps:
       - name: Checkout Code
@@ -59,14 +58,6 @@ jobs:
 
       - name: Install dependencies
         run: go mod download
-
-      # Authenticate Docker before Testcontainers runs!
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Run Tests & Generate Coverage
         run: make coverage-ci
