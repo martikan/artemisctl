@@ -1,0 +1,12 @@
+version: 1
+
+env:
+  - GO111MODULE=on
+  - CGO_ENABLED=0
+goos: darwin
+goarch: amd64
+main: ./cmd/artemisctl
+binary: artemisctl-darwin-x64
+
+ldflags:
+  - "-s -w -X main.Version={{ .Env.VERSION }}"

@@ -1,0 +1,200 @@
+name: quality-gate
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions: read-all
+
+jobs:
+  # ==========================================
+  # Formatting and linting
+  # ==========================================
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache-dependency-path: 'go.sum'
+
+      - name: formatting
+        run: |
+          fmt=$(gofmt -l .)
+          if [ -n "$fmt" ]; then
+            echo "$fmt"
+            exit 1
+          fi
+
+      - name: static-check
+        run: go vet ./...
+
+
+  # ==========================================
+  # TEST & COVERAGE
+  # ==========================================
+  test-and-coverage:
+    runs-on: ubuntu-latest
+    needs: [lint]
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache-dependency-path: 'go.sum'
+
+      - name: Install dependencies
+        run: go mod download
+
+      - name: Run Tests & Generate Coverage
+        run: make coverage-ci
+
+
+      - name: Generate Coverage Report
+        run: |
+          total=$(go tool cover -func=coverage.out | grep total | awk '{print $3}' | sed 's/%//')
+
+          echo "Total coverage: $total%"
+
+          threshold=85
+
+          echo "TOTAL_COVERAGE=$total" >> $GITHUB_ENV
+          echo "COVERAGE_THRESHOLD=$threshold" >> $GITHUB_ENV
+
+          awk -v total="$total" -v threshold="$threshold" 'BEGIN {
+            if (total < threshold) {
+              print "COVERAGE_FAIL=true"
+            } else {
+              print "COVERAGE_FAIL=false"
+            }
+          }' >> $GITHUB_ENV
+
+          # Extract worst packages
+          awk '
+          NR>1 {
+            file=$1
+            gsub(/:.*/, "", file)
+
+            stmts=$2
+            count=$3
+
+            total[file]+=stmts
+            if (count>0) covered[file]+=stmts
+          }
+          END {
+            for (f in total) {
+              cov=100*covered[f]/total[f]
+              printf "%s %.2f\n", f, cov
+            }
+          }' coverage.out | sort -k2 -n | head -6 > worst_files.txt
+
+
+          # Build report
+          echo "## 📋 Coverage Report" >> coverage-report.md
+          echo "" >> coverage-report.md
+          echo "**Total Coverage:** **${total}%**" >> coverage-report.md
+          echo "" >> coverage-report.md
+          echo "### Worst Covered Files" >> coverage-report.md
+          echo "" >> coverage-report.md
+
+          echo "| Status | File | Coverage |" >> coverage-report.md
+          echo "|------|------|------|" >> coverage-report.md
+
+          while read file cov; do
+
+            cov_int=$(printf "%.0f" $cov)
+
+            if [ "$cov_int" -lt 70 ]; then
+              icon="🔴"
+            elif [ "$cov_int" -lt 80 ]; then
+              icon="🟡"
+            elif [ "$cov_int" -lt 90 ]; then
+              icon="🟢"
+            else
+              icon="⭐"
+            fi
+
+            echo "| $icon | $file | **${cov}%** |" >> coverage-report.md
+
+          done < worst_files.txt
+
+      - name: Add Job Summary
+        run: cat coverage-report.md >> $GITHUB_STEP_SUMMARY
+
+      - name: Comment/Update PR coverage report
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+
+            const reportPath = 'coverage-report.md';
+            if (!fs.existsSync(reportPath)) {
+              throw new Error(`Coverage report not found at ${reportPath}`);
+            }
+            const body = fs.readFileSync(reportPath, 'utf8');
+
+            const prNumber = context.payload.pull_request
+              ? context.payload.pull_request.number
+              : (context.issue && context.issue.number ? context.issue.number : null);
+
+            if (!prNumber) {
+              throw new Error('No issue/PR number found in the current context.');
+            }
+
+            const comments = await github.paginate(
+              github.rest.issues.listComments,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                per_page: 100,
+              }
+            );
+
+            const existing = comments.find(c =>
+              typeof c.body === 'string' && c.body.includes('📋 Coverage Report')
+            );
+
+            if (existing) {
+              core.info(`Updating comment ${existing.id}`);
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body: body,
+              });
+            } else {
+              core.info('Creating new comment');
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body: body,
+              });
+            }
+
+      - name: Enforce Coverage Threshold
+        if: always()
+        run: |
+          echo "Coverage: $TOTAL_COVERAGE%"
+          echo "Threshold: $COVERAGE_THRESHOLD%"
+
+          if [ "$COVERAGE_FAIL" = "true" ]; then
+            echo "Coverage below threshold!"
+            exit 1
+          fi

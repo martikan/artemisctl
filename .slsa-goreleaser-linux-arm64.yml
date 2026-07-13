@@ -1,0 +1,11 @@
+version: 1
+
+env:
+  - GO111MODULE=on
+  - CGO_ENABLED=0
+goos: linux
+goarch: arm64
+main: ./cmd/artemisctl
+binary: artemisctl-linux-arm
+ldflags:
+  - "-s -w -X main.Version={{ .Env.VERSION }}"
