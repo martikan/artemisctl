@@ -48,3 +48,34 @@ func TestDedupID(t *testing.T) {
 		}
 	})
 }
+
+func TestDedupIDCore(t *testing.T) {
+	payload := []byte("core-payload-bytes")
+
+	t.Run("deterministic for same payload+queue", func(t *testing.T) {
+		if DedupIDCore(payload, "orders") != DedupIDCore(payload, "orders") {
+			t.Fatalf("expected equal ids for identical payload+queue")
+		}
+	})
+
+	t.Run("same payload, different queue produce different ids", func(t *testing.T) {
+		if DedupIDCore(payload, "orders") == DedupIDCore(payload, "shipping") {
+			t.Fatalf("expected different ids for the same payload fanned out to different queues")
+		}
+	})
+
+	t.Run("different payload, same queue produce different ids", func(t *testing.T) {
+		if DedupIDCore(payload, "orders") == DedupIDCore([]byte("other"), "orders") {
+			t.Fatalf("expected different ids for different payloads")
+		}
+	})
+
+	t.Run("core domain separated from amqp id", func(t *testing.T) {
+		// The Core domain byte (1) must keep a Core payload from ever colliding
+		// with an AMQP id (domain byte 0) over the same raw bytes and queue.
+		m := amqp.NewMessage(payload)
+		if DedupIDCore(payload, "orders") == DedupID(m, "orders") {
+			t.Fatalf("Core id collided with AMQP id despite domain separation")
+		}
+	})
+}
