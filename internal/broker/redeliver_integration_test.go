@@ -41,7 +41,7 @@ func TestRedeliverRoundTripAndDedup(t *testing.T) {
 	_ = w.Close()
 
 	// Redeliver back.
-	n, err := c.Redeliver(ctx, path, RedeliverOpts{}, nil)
+	n, _, err := c.Redeliver(ctx, path, RedeliverOpts{}, nil)
 	if err != nil {
 		t.Fatalf("redeliver: %v", err)
 	}
@@ -53,7 +53,7 @@ func TestRedeliverRoundTripAndDedup(t *testing.T) {
 	if err := store.SaveCheckpoint(path, 0); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.Redeliver(ctx, path, RedeliverOpts{}, nil); err != nil {
+	if _, _, err := c.Redeliver(ctx, path, RedeliverOpts{}, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -108,7 +108,7 @@ func TestRedeliverGracefulCancel(t *testing.T) {
 	// next Send observes the canceled context and Redeliver returns gracefully.
 	replayCtx, replayCancel := context.WithCancel(ctx)
 	defer replayCancel()
-	n, err := c.Redeliver(replayCtx, path, RedeliverOpts{}, func(sent int) {
+	n, _, err := c.Redeliver(replayCtx, path, RedeliverOpts{}, func(sent int) {
 		if sent == 1 {
 			replayCancel()
 		}

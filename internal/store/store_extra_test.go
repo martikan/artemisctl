@@ -25,7 +25,7 @@ func TestWriterOffsetAdvances(t *testing.T) {
 	if err := w.Append(rec); err != nil {
 		t.Fatal(err)
 	}
-	wantBody := 16 + 8 + 2 + len("orders") + 4 + len("hi")
+	wantBody := 1 + 16 + 8 + 2 + len("orders") + 4 + len("hi") // +1 for the v2 Kind byte
 	if got, want := w.Offset(), int64(headerLen)+int64(4+wantBody+4); got != want {
 		t.Fatalf("Offset after append = %d, want %d", got, want)
 	}

@@ -2,7 +2,6 @@ package broker
 
 import (
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"time"
@@ -103,8 +102,8 @@ func (c *Client) DrainQueue(ctx context.Context, queue string, sink RecordSink, 
 		// crash (fsync'd to the store but never acked, then re-drained) yields
 		// the SAME id and the broker collapses the pair to a single delivery.
 		//
-		// The hash is computed by dedupID over a normalized projection of the
-		// message that EXCLUDES the transport fields Artemis mutates on
+		// The hash is computed by store.DedupID over a normalized projection of
+		// the message that EXCLUDES the transport fields Artemis mutates on
 		// redelivery (Header.DeliveryCount, Header.FirstAcquirer, and the
 		// delivery-annotations section) — NOT over rec.AMQP. rec.AMQP keeps the
 		// full-fidelity bytes for a perfect replay; hashing them directly would
@@ -117,7 +116,7 @@ func (c *Client) DrainQueue(ctx context.Context, queue string, sink RecordSink, 
 		// Tradeoff (accepted): two messages that are identical apart from those
 		// excluded transport fields hash equal, so the broker drops one as a
 		// duplicate.
-		rec.UUID = dedupID(msg)
+		rec.UUID = store.DedupID(msg, queue)
 		// Persist BEFORE ack: append the record now; fsync+ack happens at
 		// batch flush, so the message is durable on disk before the broker
 		// is told it can be discarded.
@@ -137,39 +136,6 @@ func (c *Client) DrainQueue(ctx context.Context, queue string, sink RecordSink, 
 		return total, err
 	}
 	return total, nil
-}
-
-// dedupID returns a stable 16-byte content id for a message, excluding the
-// transport fields Artemis mutates on redelivery — Header.DeliveryCount and
-// Header.FirstAcquirer, plus the delivery-annotations section — so a re-drained
-// redelivered message hashes identically to its first drain. Everything that is
-// part of the message's identity (durable/priority/ttl, message annotations,
-// properties, application-properties, body, footer) is kept, so two messages
-// that differ only in, say, priority still get different ids.
-//
-// It hashes a shallow clone with a fresh Header copy (the volatile fields
-// zeroed) and the delivery annotations cleared, so the original msg — and thus
-// rec.AMQP — is never mutated and stays full-fidelity for replay.
-func dedupID(msg *amqp.Message) [16]byte {
-	clone := *msg
-	if msg.Header != nil {
-		h := *msg.Header
-		h.DeliveryCount = 0
-		h.FirstAcquirer = false
-		clone.Header = &h
-	}
-	clone.DeliveryAnnotations = nil
-	var id [16]byte
-	raw, err := clone.MarshalBinary()
-	if err != nil {
-		// A message that already marshaled successfully for rec.AMQP cannot
-		// fail to marshal here after only clearing fields; fall back to hashing
-		// the original bytes so we still produce a deterministic id.
-		raw, _ = msg.MarshalBinary()
-	}
-	sum := sha256.Sum256(raw)
-	copy(id[:], sum[:16])
-	return id
 }
 
 // DrainAll enumerates every queue via ListQueues and drains each one in

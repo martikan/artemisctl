@@ -50,7 +50,7 @@ func TestRedeliverStopsOnCorruptRecord(t *testing.T) {
 				t.Fatalf("Redeliver panicked: %v", r)
 			}
 		}()
-		n, redelivErr = c.Redeliver(context.Background(), path, RedeliverOpts{}, nil)
+		n, _, redelivErr = c.Redeliver(context.Background(), path, RedeliverOpts{}, nil)
 	}()
 
 	if n != 0 {

@@ -54,17 +54,24 @@ func (w *Writer) Append(r Record) error {
 	if len(r.Queue) > math.MaxUint16 {
 		return fmt.Errorf("store: queue name too long: %d bytes (max 65535)", len(r.Queue))
 	}
-	if len(r.AMQP) > math.MaxUint32 {
-		return fmt.Errorf("store: amqp payload too long: %d bytes", len(r.AMQP))
+	// Payload is the AMQP bytes (KindAMQP) or the serialized Core payload
+	// (KindCore); only one is populated per record.
+	payload := r.AMQP
+	if r.Kind == KindCore {
+		payload = r.CorePayload
+	}
+	if len(payload) > math.MaxUint32 {
+		return fmt.Errorf("store: payload too long: %d bytes", len(payload))
 	}
 
-	body := make([]byte, 0, 16+8+2+len(r.Queue)+4+len(r.AMQP))
+	body := make([]byte, 0, 1+16+8+2+len(r.Queue)+4+len(payload))
+	body = append(body, r.Kind)
 	body = append(body, r.UUID[:]...)
 	body = binary.BigEndian.AppendUint64(body, uint64(r.DrainedAt))
 	body = binary.BigEndian.AppendUint16(body, uint16(len(r.Queue)))
 	body = append(body, r.Queue...)
-	body = binary.BigEndian.AppendUint32(body, uint32(len(r.AMQP)))
-	body = append(body, r.AMQP...)
+	body = binary.BigEndian.AppendUint32(body, uint32(len(payload)))
+	body = append(body, payload...)
 
 	var hdr [4]byte
 	binary.BigEndian.PutUint32(hdr[:], uint32(len(body)))

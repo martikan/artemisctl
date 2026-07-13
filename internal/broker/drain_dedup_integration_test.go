@@ -59,12 +59,16 @@ func TestDrainUUIDIsDeterministicContentHash(t *testing.T) {
 		t.Fatalf("want 1 record on first drain, got %d", len(s1.recs))
 	}
 
-	// UUID must equal the content hash, not be random.
-	want := sha256.Sum256(s1.recs[0].AMQP)
+	// UUID must equal the queue-salted content hash, not be random.
+	sum := sha256.New()
+	sum.Write(s1.recs[0].AMQP)
+	sum.Write([]byte{0})
+	sum.Write([]byte(queue))
+	want := sum.Sum(nil)
 	var wantUUID [16]byte
 	copy(wantUUID[:], want[:16])
 	if s1.recs[0].UUID != wantUUID {
-		t.Fatalf("UUID is not sha256(AMQP)[:16]: got %x want %x", s1.recs[0].UUID, wantUUID)
+		t.Fatalf("UUID is not sha256(AMQP||0x00||queue)[:16]: got %x want %x", s1.recs[0].UUID, wantUUID)
 	}
 
 	// Second, independent drain of the SAME content -> SAME UUID.
@@ -96,7 +100,7 @@ func TestDrainUUIDIsDeterministicContentHash(t *testing.T) {
 // the two records have DIFFERENT rec.AMQP. Hashing rec.AMQP directly (the
 // pre-fix behavior) would therefore give the two records DIFFERENT _AMQ_DUPL_IDs
 // and the broker would NOT dedup — the exact double-delivery this WAL exists to
-// prevent. dedupID normalizes out the volatile delivery-count, so both records
+// prevent. store.DedupID normalizes out the volatile delivery-count, so both records
 // share one id and Artemis drops the repeat.
 func TestCrossDrainSingleDelivery(t *testing.T) {
 	if testing.Short() {
@@ -136,7 +140,7 @@ func TestCrossDrainSingleDelivery(t *testing.T) {
 	_ = sender.Close(context.Background())
 
 	// Drain #1 (crash before ack): receive the message and persist a record
-	// exactly as DrainQueue would (rec.AMQP = full bytes, rec.UUID = dedupID),
+	// exactly as DrainQueue would (rec.AMQP = full bytes, rec.UUID = store.DedupID),
 	// fsync it, but do NOT ack. Then settle it modified/delivery-failed so the
 	// broker redelivers it with a bumped delivery-count — standing in for the
 	// crash-then-restart the WAL must survive.
@@ -154,7 +158,7 @@ func TestCrossDrainSingleDelivery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal 1: %v", err)
 	}
-	rec1 := store.Record{Queue: queue, DrainedAt: time.Now().UnixNano(), AMQP: raw1, UUID: dedupID(msg1)}
+	rec1 := store.Record{Queue: queue, DrainedAt: time.Now().UnixNano(), AMQP: raw1, UUID: store.DedupID(msg1, queue)}
 	if err := sink.Append(rec1); err != nil {
 		t.Fatalf("append 1: %v", err)
 	}
@@ -192,7 +196,7 @@ func TestCrossDrainSingleDelivery(t *testing.T) {
 	}
 
 	// Redeliver the two-record store; dedup must collapse to a single message.
-	if _, err := c.Redeliver(ctx, path, RedeliverOpts{}, nil); err != nil {
+	if _, _, err := c.Redeliver(ctx, path, RedeliverOpts{}, nil); err != nil {
 		t.Fatalf("redeliver: %v", err)
 	}
 

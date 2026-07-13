@@ -7,7 +7,7 @@ COVERAGE_FILE=coverage.out
 # Linker flags to strip debug information
 LDFLAGS=-ldflags="-s -w"
 
-.PHONY: all build clean test coverage release help it-clean
+.PHONY: all build clean test coverage release help it-clean fixtures
 
 # Name of the shared, reused integration-test broker container.
 IT_BROKER=artemisctl-it-broker
@@ -62,6 +62,15 @@ clean:
 	@echo "==> go mod tidy to clean up go.mod and go.sum..."
 	@go mod tidy
 
+## fixtures: Regenerate internal/journal/testdata from a live 2.42 container
+# The harvester is an integration test gated behind ARTEMISCTL_HARVEST=1 (so
+# plain `make test` skips it). It uses a dedicated container, not the shared
+# reused broker, because it stops the broker to freeze the journal.
+fixtures:
+	@echo "==> Harvesting Artemis 2.42 data-dir fixture..."
+	ARTEMISCTL_HARVEST=1 go test -run TestHarvestFixture -v -p 1 -timeout 15m ./internal/journal/
+	@echo "==> Done. See internal/journal/testdata/"
+
 ## it-clean: Remove the shared integration-test broker container
 # Integration tests reuse one broker (Reuse: true) and never terminate it, and
 # Ryuk cannot reap reused containers (and is disabled under rootless podman), so
@@ -80,5 +89,6 @@ help:
 	@echo "  test     - Run all tests"
 	@echo "  coverage - Run tests with coverage and generate an HTML report"
 	@echo "  release  - Cross-compile the CLI for Linux, macOS, and Windows"
+	@echo "  fixtures - Regenerate internal/journal/testdata from a live 2.42 container"
 	@echo "  it-clean - Remove the shared integration-test broker container"
 	@echo "  clean    - Remove build artifacts"

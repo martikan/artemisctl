@@ -74,14 +74,20 @@ func TestWriterEncodesRecordBytesExactly(t *testing.T) {
 		t.Fatalf("bad version: got %d", b[4])
 	}
 
-	wantBodyLen := 16 + 8 + 2 + len(wantQueue) + 4 + len(wantAMQP)
+	// v2 body leads with a 1-byte Kind, then the v1 layout.
+	wantBodyLen := 1 + 16 + 8 + 2 + len(wantQueue) + 4 + len(wantAMQP)
 
 	totalLen := binary.BigEndian.Uint32(b[5:9])
 	if int(totalLen) != wantBodyLen {
 		t.Fatalf("bad totalLen: got %d, want %d", totalLen, wantBodyLen)
 	}
 
-	body := b[9 : 9+int(totalLen)]
+	fullBody := b[9 : 9+int(totalLen)]
+
+	if fullBody[0] != KindAMQP {
+		t.Fatalf("bad kind: got %d, want %d", fullBody[0], KindAMQP)
+	}
+	body := fullBody[1:]
 
 	gotUUID := body[0:16]
 	if !bytes.Equal(gotUUID, wantUUID[:]) {
@@ -122,7 +128,7 @@ func TestWriterEncodesRecordBytesExactly(t *testing.T) {
 	crcStart := 9 + int(totalLen)
 	crcEnd := crcStart + 4
 	gotCRC := binary.BigEndian.Uint32(b[crcStart:crcEnd])
-	wantCRC := crc32.ChecksumIEEE(body)
+	wantCRC := crc32.ChecksumIEEE(fullBody)
 	if gotCRC != wantCRC {
 		t.Fatalf("bad crc: got %d, want %d", gotCRC, wantCRC)
 	}

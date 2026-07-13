@@ -80,6 +80,14 @@ func (c *Client) applyAddressSettings(ctx context.Context, match, settingsJSON s
 	return nil
 }
 
+// ApplyAddressSettings applies a settings object (JSON) to an address match via
+// the two-arg addAddressSettings(String,String) overload. It is the exported
+// form of applyAddressSettings for callers outside this package (e.g. the
+// journal fixture harvester, which forces paging on one address).
+func (c *Client) ApplyAddressSettings(ctx context.Context, match, settingsJSON string) error {
+	return c.applyAddressSettings(ctx, match, settingsJSON)
+}
+
 // asBrokerTooOld maps the broker's "no operation addAddressSettings" rejection
 // (returned by brokers without the two-arg JSON overload, e.g. 2.31.x) to the
 // clearer ErrBrokerTooOld, and passes any other error through unchanged.

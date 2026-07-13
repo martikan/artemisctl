@@ -18,9 +18,10 @@ var ErrCorrupt = errors.New("store: corrupt or truncated record")
 // header on open and each record's CRC on read; call Next until io.EOF, or
 // SeekTo an offset first to resume. A Reader is not safe for concurrent use.
 type Reader struct {
-	f      *os.File
-	offset int64
-	size   int64
+	f       *os.File
+	offset  int64
+	size    int64
+	version byte
 }
 
 // OpenReader opens path and verifies the store magic and version, returning a
@@ -35,7 +36,7 @@ func OpenReader(path string) (*Reader, error) {
 		_ = f.Close()
 		return nil, fmt.Errorf("read header: %w", err)
 	}
-	if string(hdr[:4]) != Magic || hdr[4] != Version {
+	if string(hdr[:4]) != Magic || (hdr[4] != Version && hdr[4] != Version1) {
 		_ = f.Close()
 		return nil, fmt.Errorf("bad store header (magic %q version %d)", hdr[:4], hdr[4])
 	}
@@ -44,7 +45,7 @@ func OpenReader(path string) (*Reader, error) {
 		_ = f.Close()
 		return nil, fmt.Errorf("stat store: %w", err)
 	}
-	return &Reader{f: f, offset: headerLen, size: fi.Size()}, nil
+	return &Reader{f: f, offset: headerLen, size: fi.Size(), version: hdr[4]}, nil
 }
 
 // SeekTo positions the reader at offset so the next Next reads the record
@@ -91,7 +92,7 @@ func (r *Reader) Next() (Record, int64, error) {
 		return Record{}, r.offset, fmt.Errorf("%w: crc mismatch at offset %d", ErrCorrupt, r.offset)
 	}
 
-	rec, err := decodeBody(body)
+	rec, err := decodeBody(body, r.version)
 	if err != nil {
 		return Record{}, r.offset, fmt.Errorf("%w: %w", ErrCorrupt, err)
 	}
@@ -99,11 +100,19 @@ func (r *Reader) Next() (Record, int64, error) {
 	return rec, r.offset, nil
 }
 
-func decodeBody(body []byte) (Record, error) {
+func decodeBody(body []byte, version byte) (Record, error) {
+	var rec Record
+	// v2+ leads with a 1-byte Kind; v1 has no Kind byte (implicitly KindAMQP).
+	if version >= Version {
+		if len(body) < 1 {
+			return Record{}, errors.New("body too short")
+		}
+		rec.Kind = body[0]
+		body = body[1:]
+	}
 	if len(body) < 16+8+2 {
 		return Record{}, errors.New("body too short")
 	}
-	var rec Record
 	copy(rec.UUID[:], body[:16])
 	p := 16
 	rec.DrainedAt = int64(binary.BigEndian.Uint64(body[p : p+8]))
@@ -118,9 +127,14 @@ func decodeBody(body []byte) (Record, error) {
 	alen := int(binary.BigEndian.Uint32(body[p : p+4]))
 	p += 4
 	if p+alen != len(body) {
-		return Record{}, errors.New("amqp length overflow")
+		return Record{}, errors.New("payload length overflow")
 	}
-	rec.AMQP = append([]byte(nil), body[p:p+alen]...)
+	payload := append([]byte(nil), body[p:p+alen]...)
+	if rec.Kind == KindCore {
+		rec.CorePayload = payload
+	} else {
+		rec.AMQP = payload
+	}
 	return rec, nil
 }
 

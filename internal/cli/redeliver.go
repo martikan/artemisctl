@@ -43,7 +43,7 @@ func newRedeliverCmd() *cobra.Command {
 			ctx, stop := signalCtx()
 			defer stop()
 
-			n, err := c.Redeliver(ctx, in, broker.RedeliverOpts{QueueOverride: queueOverride},
+			n, coreSkipped, err := c.Redeliver(ctx, in, broker.RedeliverOpts{QueueOverride: queueOverride},
 				func(sent int) {
 					if sent%100 == 0 {
 						fmt.Fprintf(cmd.OutOrStdout(), "redelivered %d...\n", sent)
@@ -58,6 +58,9 @@ func newRedeliverCmd() *cobra.Command {
 				return err
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "redelivered %d messages from %s\n", n, in)
+			if coreSkipped > 0 {
+				fmt.Fprintf(cmd.OutOrStdout(), "warning: %d Core-protocol record(s) could not be converted to AMQP and were skipped (left in the store)\n", coreSkipped)
+			}
 			return nil
 		},
 	}

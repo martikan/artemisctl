@@ -8,19 +8,35 @@
 package store
 
 const (
-	Magic          = "ARTX" // 4-byte file signature at offset 0
-	Version   byte = 1      // format version, one byte after the magic
-	headerLen      = 5      // len(Magic) + 1 version byte
+	Magic        = "ARTX" // 4-byte file signature at offset 0
+	Version byte = 2      // format version, one byte after the magic
+
+	// Version1 stores AMQP records only, with no per-record Kind byte. Reader
+	// still accepts it (every v1 record is implicitly KindAMQP).
+	Version1  byte = 1
+	headerLen      = 5 // len(Magic) + 1 version byte
+)
+
+// Record kinds (v2+). KindAMQP records carry raw AMQP wire bytes in AMQP;
+// KindCore records carry a serialized Core payload in CorePayload (which
+// redeliver converts to AMQP on send — Core cannot be sent over the wire
+// directly by this AMQP-only client).
+const (
+	KindAMQP byte = 0
+	KindCore byte = 1
 )
 
 // Record is one drained message as held in the WAL. UUID is the deterministic
 // content id reused as _AMQ_DUPL_ID on redelivery to defeat duplicates; Queue
-// is the originating queue; DrainedAt is the drain time in unix nanoseconds;
-// AMQP is the raw amqp.Message wire encoding, replayed verbatim for
-// perfect-fidelity redelivery.
+// is the originating queue; DrainedAt is the drain time in unix nanoseconds.
+// Kind selects the payload: KindAMQP uses AMQP (raw amqp.Message wire encoding,
+// replayed verbatim); KindCore uses CorePayload (a serialized journal
+// CorePayload, converted to AMQP at redeliver time).
 type Record struct {
-	UUID      [16]byte
-	Queue     string
-	DrainedAt int64
-	AMQP      []byte
+	UUID        [16]byte
+	Queue       string
+	DrainedAt   int64
+	Kind        byte
+	AMQP        []byte
+	CorePayload []byte
 }

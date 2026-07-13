@@ -27,18 +27,18 @@ type RedeliverOpts struct {
 // is only advanced after a send succeeds, so a crash mid-replay leaves the
 // checkpoint pointing at the last durably-redelivered record, not beyond
 // it.
-func (c *Client) Redeliver(ctx context.Context, storePath string, opts RedeliverOpts, onProgress func(sent int)) (int, error) {
+func (c *Client) Redeliver(ctx context.Context, storePath string, opts RedeliverOpts, onProgress func(sent int)) (sent, coreSkipped int, err error) {
 	startOffset, err := store.LoadCheckpoint(storePath)
 	if err != nil {
-		return 0, fmt.Errorf("load checkpoint: %w", err)
+		return 0, 0, fmt.Errorf("load checkpoint: %w", err)
 	}
 	r, err := store.OpenReader(storePath)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	defer r.Close()
 	if err := r.SeekTo(startOffset); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 
 	senders := map[string]*amqp.Sender{}
@@ -64,25 +64,41 @@ func (c *Client) Redeliver(ctx context.Context, storePath string, opts Redeliver
 		return s, nil
 	}
 
-	sent := 0
 	for {
 		// Graceful cancellation (e.g. SIGINT): stop between records and
 		// return a clean context error. The last successful send has already
 		// advanced the durable checkpoint, so re-running resumes exactly.
-		if err := ctx.Err(); err != nil {
-			return sent, err
+		if cerr := ctx.Err(); cerr != nil {
+			return sent, coreSkipped, cerr
 		}
-		rec, afterOffset, err := r.Next()
-		if errors.Is(err, io.EOF) {
+		rec, afterOffset, nerr := r.Next()
+		if errors.Is(nerr, io.EOF) {
 			break
 		}
-		if err != nil {
-			return sent, err // ErrCorrupt: stop, good prefix already delivered
+		if nerr != nil {
+			return sent, coreSkipped, nerr // ErrCorrupt: stop, good prefix already delivered
 		}
 
 		var msg amqp.Message
-		if err := msg.UnmarshalBinary(rec.AMQP); err != nil {
-			return sent, fmt.Errorf("unmarshal record: %w", err)
+		switch rec.Kind {
+		case store.KindCore:
+			// Core records have no AMQP wire form: convert on send. A record
+			// that fails to convert is skipped (with the checkpoint advanced so
+			// it isn't retried forever) rather than aborting the whole replay --
+			// the faithful Core record stays in the store for a later attempt.
+			converted, cerr := coreToAMQP(rec.CorePayload)
+			if cerr != nil {
+				coreSkipped++
+				if serr := store.SaveCheckpoint(storePath, afterOffset); serr != nil {
+					return sent, coreSkipped, fmt.Errorf("save checkpoint: %w", serr)
+				}
+				continue
+			}
+			msg = *converted
+		default:
+			if uerr := msg.UnmarshalBinary(rec.AMQP); uerr != nil {
+				return sent, coreSkipped, fmt.Errorf("unmarshal record: %w", uerr)
+			}
 		}
 		if msg.ApplicationProperties == nil {
 			msg.ApplicationProperties = map[string]interface{}{}
@@ -93,20 +109,20 @@ func (c *Client) Redeliver(ctx context.Context, storePath string, opts Redeliver
 		if opts.QueueOverride != "" {
 			queue = opts.QueueOverride
 		}
-		sender, err := senderFor(queue)
-		if err != nil {
-			return sent, err
+		sender, serr := senderFor(queue)
+		if serr != nil {
+			return sent, coreSkipped, serr
 		}
-		if err := sender.Send(ctx, &msg, nil); err != nil {
-			return sent, fmt.Errorf("send to %s: %w", queue, err)
+		if serr := sender.Send(ctx, &msg, nil); serr != nil {
+			return sent, coreSkipped, fmt.Errorf("send to %s: %w", queue, serr)
 		}
-		if err := store.SaveCheckpoint(storePath, afterOffset); err != nil {
-			return sent, fmt.Errorf("save checkpoint: %w", err)
+		if serr := store.SaveCheckpoint(storePath, afterOffset); serr != nil {
+			return sent, coreSkipped, fmt.Errorf("save checkpoint: %w", serr)
 		}
 		sent++
 		if onProgress != nil {
 			onProgress(sent)
 		}
 	}
-	return sent, nil
+	return sent, coreSkipped, nil
 }

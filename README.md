@@ -271,6 +271,75 @@ store *before* the messages are acknowledged on the broker. A crash between the
 `fsync` and the ack leaves a message on the broker that is drained again on the
 next run — an at-least-once duplicate, absorbed by redelivery dedup (below).
 
+### `salvage`
+
+**Offline.** Recovers messages from a *stopped* broker's data directory
+straight off disk — no broker connection at all — and writes every
+recoverable message to a local `.artx` store, replayed later with
+`redeliver` exactly like an `export`ed store. Use this when the broker is
+dead and won't start, so `export` (which needs a live AMQP connection) isn't
+an option. See [`docs/offline-recovery.md`](docs/offline-recovery.md) for
+the full step-by-step runbook, including the paging and Core-protocol
+caveats.
+
+`salvage` is the native equivalent of `artemis data exp` — its output is a
+`.artx` store replayed with `redeliver`, not XML consumed by `artemis data
+imp`.
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--data` | *(required unless `--bindings` and `--journal` are both given)* | Broker data directory; sub-dirs derived: `bindings/`, `journal/`, `large-messages/`, `paging/` |
+| `--bindings` | derived from `--data` | Bindings journal dir override |
+| `--journal` | derived from `--data` | Message journal dir override |
+| `--large-messages` | derived from `--data` | Large-messages dir override |
+| `--paging` | derived from `--data` | Paging dir override |
+| `--out` | *(required)* | Output store file |
+| `--force` | `false` | Proceed even if the `server.lock` live-broker probe suggests a broker is still running |
+| `--allow-skips` | `false` | Exit 0 even though some messages were skipped or corruption diagnostics were reported (unsupported/corrupt data) |
+
+```bash
+artemisctl salvage --data /mnt/rescue/data-snapshot --out rescue.artx
+```
+
+- **No broker connection.** `salvage` ignores the global `--url`/
+  `--username`/`--password`/`--timeout` connection flags entirely — it never
+  dials the broker, only reads the data directory files.
+- **Live-broker guard:** refuses to run if `server.lock` (probed at
+  `<journal>/server.lock`, `<data>/server.lock`, or `<data>/../server.lock`)
+  is flock-held, i.e. a broker process is still using that exact directory —
+  use `export` instead, or `--force` if you're certain the lock is stale. A
+  copied/snapshotted data directory passes the guard without `--force`
+  because nothing holds the flock on the copy.
+- **Core-protocol messages:** decoded and exported alongside AMQP messages
+  (standard, large, and paged). Because this tool is an AMQP-1.0 client, it
+  cannot speak the Core wire protocol on redelivery, so `redeliver` converts
+  each Core record to an equivalent AMQP message before sending; the broker
+  re-converts it to Core for any Core/JMS consumer. Conversion covers the
+  common body types (text/bytes/map/object/stream) and standard headers; a Core
+  message that cannot be converted is skipped on redelivery (left in the store),
+  never silently dropped. Legacy pre-persister core adds (userType 31, not
+  produced by modern brokers) are still reported as skips.
+- **At-least-once paging:** a handful of already-consumed messages from the
+  most recently paged, partially-consumed page may be resurrected — matching
+  the tool's existing at-least-once philosophy. See the runbook for the full
+  caveat.
+- **Empty result:** if nothing survives, the summary reports "salvaged 0
+  messages" and **no output file is written** — never replay a store you
+  didn't get an actual path for.
+- **Skips and corruption fail the exit code.** Unrecoverable records are
+  itemized in a `skipped:` section; damaged journal/bindings/page-file
+  records (bad check-size, truncated record, broken page framing, an
+  undecodable bindings-record body) are itemized in a separate
+  `diagnostics:` section, naming the file and offset. Both fail the exit
+  code by default, unless `--allow-skips` — a recovery tool must not
+  silently lose messages. Not every `diagnostics:` entry is corruption:
+  informational notes (missing large-messages/paging dir, orphaned
+  large-message files, unknown-queue fallback, benign fileID-mismatch
+  reuse-leftover notes) never gate the exit code. The `.artx` store is still
+  written even when skips or corruption diagnostics are present; only the
+  exit code is gated. See [`docs/offline-recovery.md`](docs/offline-recovery.md)
+  for the full breakdown of which diagnostics gate and which don't.
+
 ### `redeliver`
 
 Replay a store file back to the broker.
@@ -319,6 +388,29 @@ artemisctl uncordon --url dying-broker:61616
 
 If `redeliver` is interrupted, just run the same command again — it resumes from
 the checkpoint and dedup prevents double-delivery.
+
+**Broker won't start at all?** The workflow above needs a live AMQP
+connection for step 2 (`export`). If the broker is dead — process won't
+start, no connection possible — recover offline from its data directory
+instead:
+
+```bash
+# 1. Snapshot the dead broker's data dir — salvage is read-only, but the
+#    on-disk journal is the only copy until you've salvaged it.
+cp -a /var/lib/artemis/data /mnt/rescue/data-snapshot
+
+# 2. Salvage straight off disk — no broker connection needed.
+artemisctl salvage --data /mnt/rescue/data-snapshot --out rescue.artx
+
+# 3. Same replay path as above, into a fresh/wiped broker. Never boot the
+#    old data dir again once this is done — see the runbook for why.
+artemisctl health   --url new-broker:61616
+artemisctl redeliver --in rescue.artx --url new-broker:61616
+```
+
+See [`docs/offline-recovery.md`](docs/offline-recovery.md) for the full
+runbook, including the live-broker guard, the paging/dedup caveats, and a
+failure-mode appendix.
 
 ## Store format
 
