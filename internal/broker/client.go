@@ -38,7 +38,7 @@ type Client struct {
 // bounded by ctx. On any failure it cleans up a half-open connection and
 // returns a wrapped error. The returned Client must be closed with Close.
 func Connect(ctx context.Context, p ConnectionProps) (*Client, error) {
-	conn, err := amqp.Dial(ctx, fmt.Sprintf("amqp://%s", buildConnectionURL(p)), nil)
+	conn, err := amqp.Dial(ctx, fmt.Sprintf("amqp://%s", p.URL), connOptions(p))
 	if err != nil {
 		return nil, fmt.Errorf("dial broker: %w", err)
 	}
@@ -48,6 +48,17 @@ func Connect(ctx context.Context, p ConnectionProps) (*Client, error) {
 		return nil, fmt.Errorf("open session: %w", err)
 	}
 	return &Client{conn: conn, sess: sess}, nil
+}
+
+// connOptions builds the SASL PLAIN options for p, or nil for an anonymous
+// connection. Credentials travel in the SASL handshake rather than the dial
+// URL, so passwords may contain any characters (/, =, @, ...) without needing
+// URL escaping.
+func connOptions(p ConnectionProps) *amqp.ConnOptions {
+	if p.Username == "" && p.Password == "" {
+		return nil
+	}
+	return &amqp.ConnOptions{SASLType: amqp.SASLTypePlain(p.Username, p.Password)}
 }
 
 // Session exposes the Client's default AMQP session so callers in this package
@@ -65,11 +76,4 @@ func (c *Client) Close(ctx context.Context) error {
 		return c.conn.Close()
 	}
 	return nil
-}
-
-func buildConnectionURL(p ConnectionProps) string {
-	if p.Username != "" && p.Password != "" {
-		return fmt.Sprintf("%s:%s@%s", p.Username, p.Password, p.URL)
-	}
-	return p.URL
 }
