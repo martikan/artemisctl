@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/Azure/go-amqp"
@@ -17,20 +18,147 @@ type RecordSink interface {
 	Sync() error
 }
 
-// DrainQueue consumes every message currently on queue, persisting each
-// batch to sink (Append + Sync/fsync) before acking the broker, so a crash
-// mid-drain never loses a message: it is either still on the broker
-// (unacked) or durably on disk (or both, which is safe to re-drain/replay).
+// PartialDrainError reports that a drain finished with messages still on the
+// broker. It carries the broker's own counters at the moment the drain gave
+// up, so the caller can see WHY the rest did not come: scheduled for later,
+// in flight to another consumer, or a paused queue.
+//
+// This exists because an idle receive is not proof of an empty queue, and an
+// export that quietly returns a partial file is worse than one that fails.
+type PartialDrainError struct {
+	Queue   string
+	Drained int
+	Stat    QueueStat
+}
+
+
+// outcome is what the broker's counters say about a finished drain pass.
+type outcome int
+
+const (
+	// drainComplete: the broker holds nothing more.
+	drainComplete outcome = iota
+	// drainRetry: messages remain and the broker would hand them over, so the
+	// quiet gap was a stall (GC, depaging, slow network) rather than an end.
+	drainRetry
+	// drainStuck: messages remain that the broker will not deliver to us now.
+	drainStuck
+)
+
+// maxFruitlessPasses bounds how many times in a row DrainQueue will re-attempt
+// a queue that the broker says still holds deliverable messages but that hands
+// over nothing. One fruitless pass is expected and harmless (the broker can
+// still be settling the previous pass's acks, or briefly stalled), but a queue
+// that keeps promising messages it never delivers must fail rather than spin.
+// Each pass already costs a full idle timeout, so this stays cheap.
+const maxFruitlessPasses = 3
+
+func (e *PartialDrainError) Error() string {
+	reasons := make([]string, 0, 3)
+	if e.Stat.ScheduledCount > 0 {
+		reasons = append(reasons, fmt.Sprintf("%d scheduled for later delivery", e.Stat.ScheduledCount))
+	}
+	if e.Stat.DeliveringCount > 0 && e.Stat.ConsumerCount > 0 {
+		reasons = append(reasons, fmt.Sprintf("%d in flight to %d other consumer(s)",
+			e.Stat.DeliveringCount, e.Stat.ConsumerCount))
+	}
+	if e.Stat.Paused {
+		reasons = append(reasons, "queue is paused")
+	}
+	why := "the broker stopped delivering them"
+	if len(reasons) > 0 {
+		why = strings.Join(reasons, ", ")
+	}
+	return fmt.Sprintf("incomplete drain of %s: took %d message(s), but %d remain on the broker (%s)",
+		e.Queue, e.Drained, e.Stat.MessageCount, why)
+}
+
+// DrainQueue consumes every message on queue, persisting each batch to sink
+// (Append + Sync/fsync) before acking the broker, so a crash mid-drain never
+// loses a message: it is either still on the broker (unacked) or durably on
+// disk (or both, which is safe to re-drain/replay).
+//
+// Completion is decided by the broker, not by silence. A gap in delivery only
+// ends a drain *pass*; DrainQueue then asks the broker for the queue's real
+// depth and acts on it:
+//
+//   - depth 0: the queue is genuinely empty, the drain is complete.
+//   - messages remain and are deliverable: the gap was a stall (broker GC,
+//     depaging, a slow network), so it drains again.
+//   - messages remain but the broker is holding them back (scheduled, in
+//     flight to another consumer, paused queue): no amount of waiting will
+//     produce them, so it returns *PartialDrainError with the counters.
+//
+// The earlier behaviour — treat any idle gap as "queue drained" and return nil
+// — silently under-drained: a queue reporting 210K messages could export ~50K
+// and still exit 0, because most of the depth was never deliverable to us.
+func (c *Client) DrainQueue(ctx context.Context, queue string, sink RecordSink, idle time.Duration, batch int) (int, error) {
+	total := 0
+	fruitless := 0
+	for {
+		n, err := c.drainPass(ctx, queue, sink, idle, batch)
+		total += n
+		if err != nil {
+			return total, err
+		}
+		if n > 0 {
+			fruitless = 0
+		} else {
+			fruitless++
+		}
+
+		stat, err := c.QueueStatByName(ctx, queue)
+		if err != nil {
+			if errors.Is(err, ErrQueueNotFound) {
+				// Auto-delete removed the queue once we emptied it; nothing
+				// is left behind, so the drain is complete.
+				return total, nil
+			}
+			return total, fmt.Errorf("verify drain of %s: %w", queue, err)
+		}
+		switch drainOutcome(stat, fruitless) {
+		case drainComplete:
+			return total, nil
+		case drainRetry:
+			continue
+		default:
+			return total, &PartialDrainError{Queue: queue, Drained: total, Stat: stat}
+		}
+	}
+}
+
+
+// drainOutcome decides what a pass means, given the broker's counters
+// afterwards and how many consecutive passes have now come back empty
+// (fruitless == 0 means the last pass took messages). It is the whole of the
+// "is this drain actually finished?" judgement, kept pure so every case is
+// testable without a broker.
+func drainOutcome(stat QueueStat, fruitless int) outcome {
+	if stat.MessageCount == 0 {
+		return drainComplete
+	}
+	// Retrying is only worth it if the broker would actually hand the
+	// remainder over -- otherwise we would spin forever on messages we cannot
+	// have -- and only while passes are still producing something.
+	if stat.DeliverableNow() > 0 && fruitless < maxFruitlessPasses {
+		return drainRetry
+	}
+	return drainStuck
+}
+
+// drainPass consumes messages from queue until the broker goes quiet for idle,
+// returning how many it took. A quiet broker ends the pass; it does NOT mean
+// the queue is empty -- only DrainQueue's check against the broker's counters
+// can establish that.
 //
 // Idle detection: each Receive uses a per-call context with timeout idle;
-// a context.DeadlineExceeded from Receive is treated as "queue is empty",
-// not an error, and ends the drain — but only when the outer ctx is still
-// live. If the caller's own ctx has expired/been canceled, that deadline
-// propagates to the child context too, so DeadlineExceeded alone can't
-// distinguish "queue idle" from "caller ran out of time"; we disambiguate
-// against ctx.Err() below so a caller-timeout is reported as an error
-// instead of a false "fully drained".
-func (c *Client) DrainQueue(ctx context.Context, queue string, sink RecordSink, idle time.Duration, batch int) (int, error) {
+// a context.DeadlineExceeded from Receive ends the pass, but only when the
+// outer ctx is still live. If the caller's own ctx has expired/been canceled,
+// that deadline propagates to the child context too, so DeadlineExceeded alone
+// can't distinguish "broker quiet" from "caller ran out of time"; we
+// disambiguate against ctx.Err() below so a caller-timeout is reported as an
+// error instead of a false "fully drained".
+func (c *Client) drainPass(ctx context.Context, queue string, sink RecordSink, idle time.Duration, batch int) (int, error) {
 	if batch <= 0 {
 		// Credit: int32(batch) with batch<=0 grants zero link credit, which
 		// silently receives nothing (or reports (0,nil) on a non-empty
@@ -81,7 +209,7 @@ func (c *Client) DrainQueue(ctx context.Context, queue string, sink RecordSink, 
 					// surface it as an error instead.
 					return total, ctx.Err()
 				}
-				break // queue idle => drained
+				break // broker quiet => end of pass (NOT proof of an empty queue)
 			}
 			// Messages already Appended-but-not-yet-Acked when this error
 			// aborts the drain stay safely on the broker (no loss), but may
@@ -141,21 +269,33 @@ func (c *Client) DrainQueue(ctx context.Context, queue string, sink RecordSink, 
 // DrainAll enumerates every queue via ListQueues and drains each one in
 // turn, invoking onQueue (if non-nil) after each queue completes with the
 // queue's name and the number of messages drained from it.
+//
+// A queue that cannot be fully drained does not abort the run: whatever the
+// other queues hold is still worth exporting, so DrainAll records the
+// *PartialDrainError, moves on, and returns every one of them joined together
+// at the end. The messages it did take are already persisted, and the returned
+// count reflects them, but the error means the export is NOT complete.
+// Any other error (a broken connection, a failing sink) aborts immediately.
 func (c *Client) DrainAll(ctx context.Context, sink RecordSink, idle time.Duration, batch int, onQueue func(name string, n int)) (int, error) {
 	queues, err := c.ListQueues(ctx)
 	if err != nil {
 		return 0, err
 	}
 	total := 0
+	var partial []error
 	for _, q := range queues {
 		n, err := c.DrainQueue(ctx, q.Name, sink, idle, batch)
+		total += n
 		if err != nil {
-			return total, err
+			var pde *PartialDrainError
+			if !errors.As(err, &pde) {
+				return total, err
+			}
+			partial = append(partial, err)
 		}
 		if onQueue != nil {
 			onQueue(q.Name, n)
 		}
-		total += n
 	}
-	return total, nil
+	return total, errors.Join(partial...)
 }

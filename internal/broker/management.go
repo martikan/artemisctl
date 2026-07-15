@@ -9,12 +9,50 @@ import (
 	"github.com/Azure/go-amqp"
 )
 
-// QueueStat is one queue's name and current message depth, as reported by the
-// broker's listQueues management operation. MessageCount arrives as a
-// JSON string and is decoded into an int64.
+// QueueStat is one queue's depth and delivery state, as reported by the
+// broker's listQueues management operation. Every counter arrives as a JSON
+// string and is decoded into its Go type.
+//
+// MessageCount is the total depth, and it is NOT the number of messages a
+// consumer can receive right now: it also counts messages the broker will not
+// hand out yet. ScheduledCount (scheduled delivery / redelivery delay, not due
+// yet) and DeliveringCount (already dispatched to some consumer, awaiting
+// settlement) are both included in it, and a Paused queue dispatches nothing at
+// all regardless of the counters. DeliverableNow is the subset a drain can
+// actually expect to receive.
 type QueueStat struct {
-	Name         string `json:"name"`
-	MessageCount int64  `json:"messageCount,string"`
+	Name            string `json:"name"`
+	MessageCount    int64  `json:"messageCount,string"`
+	ScheduledCount  int64  `json:"scheduledCount,string"`
+	DeliveringCount int64  `json:"deliveringCount,string"`
+	ConsumerCount   int64  `json:"consumerCount,string"`
+	Paused          bool   `json:"paused,string"`
+}
+
+// DeliverableNow reports how many of the queue's messages the broker would
+// hand to a consumer right now: the depth minus the messages it is holding
+// back. A paused queue delivers nothing, so it always reports 0.
+//
+// DeliveringCount only counts against the total while some consumer is
+// attached to hold those messages. With no consumers, an in-flight count is
+// just settlement lag -- typically our own just-closed receiver, whose unacked
+// messages the broker is in the middle of returning to the queue -- and those
+// messages ARE coming back, so they must not be mistaken for messages we can
+// never have.
+func (q QueueStat) DeliverableNow() int64 {
+	if q.Paused {
+		return 0
+	}
+	n := q.MessageCount - q.ScheduledCount
+	if q.ConsumerCount > 0 {
+		n -= q.DeliveringCount
+	}
+	if n < 0 {
+		// The counters are sampled independently and can overlap in flight;
+		// never report a negative backlog.
+		return 0
+	}
+	return n
 }
 
 // callManagement performs a request/reply against activemq.management.
@@ -67,7 +105,76 @@ func (c *Client) ListQueues(ctx context.Context) ([]QueueStat, error) {
 	return parseQueueStatsReply(reply)
 }
 
+// ErrQueueNotFound is returned by QueueStatByName when the broker does not
+// list the named queue, which normally means it has been auto-deleted.
+var ErrQueueNotFound = fmt.Errorf("queue not found on broker")
+
+// QueueStatByName returns the broker's current stats for a single queue. It
+// asks the broker to filter by exact name rather than listing every queue, so
+// it stays cheap enough to call repeatedly during a drain. Unlike ListQueues it
+// does not filter internal queues: the caller already named the queue it wants.
+func (c *Client) QueueStatByName(ctx context.Context, name string) (QueueStat, error) {
+	filter, err := json.Marshal(map[string]string{
+		"field": "name", "operation": "EQUALS", "value": name,
+		"sortField": "messageCount", "sortOrder": "desc",
+	})
+	if err != nil {
+		return QueueStat{}, fmt.Errorf("marshal queue filter: %w", err)
+	}
+	body, err := json.Marshal([]interface{}{string(filter), 1, 1})
+	if err != nil {
+		return QueueStat{}, fmt.Errorf("marshal listQueues args: %w", err)
+	}
+	reply, err := c.callManagement(ctx, "broker", "listQueues", string(body))
+	if err != nil {
+		return QueueStat{}, err
+	}
+	stats, err := parseQueueStatsRaw(reply)
+	if err != nil {
+		return QueueStat{}, err
+	}
+	for _, q := range stats {
+		if q.Name == name {
+			return q, nil
+		}
+	}
+	return QueueStat{}, fmt.Errorf("%w: %s", ErrQueueNotFound, name)
+}
+
+// PurgeQueue removes every message from a queue, including messages a consumer
+// cannot receive (scheduled, or held for redelivery). It returns the number of
+// messages removed. This is destructive and does not persist anything: it is
+// for resetting a queue, not for exporting it.
+func (c *Client) PurgeQueue(ctx context.Context, name string) (int64, error) {
+	reply, err := c.callManagement(ctx, "queue."+name, "removeAllMessages", "[]")
+	if err != nil {
+		return 0, fmt.Errorf("purge %s: %w", name, err)
+	}
+	// The reply value is the removed count, encoded as a JSON array holding a
+	// single number ("[12]"), matching the other management replies' shape.
+	raw, ok := reply.Value.(string)
+	if !ok {
+		return 0, nil
+	}
+	var outer []int64
+	if err := json.Unmarshal([]byte(raw), &outer); err != nil || len(outer) == 0 {
+		return 0, nil
+	}
+	return outer[0], nil
+}
+
 func parseQueueStatsReply(reply *amqp.Message) ([]QueueStat, error) {
+	stats, err := parseQueueStatsRaw(reply)
+	if err != nil {
+		return nil, err
+	}
+	return filterInternalQueues(stats), nil
+}
+
+// parseQueueStatsRaw decodes a listQueues reply without filtering internal
+// queues, so a caller asking for one queue by name gets it back whatever it is
+// called.
+func parseQueueStatsRaw(reply *amqp.Message) ([]QueueStat, error) {
 	strVal, ok := reply.Value.(string)
 	if !ok {
 		return nil, fmt.Errorf("unexpected management response format")
@@ -85,7 +192,7 @@ func parseQueueStatsReply(reply *amqp.Message) ([]QueueStat, error) {
 	if err := json.Unmarshal([]byte(outer[0]), &paged); err != nil {
 		return nil, fmt.Errorf("parse paged response: %w", err)
 	}
-	return filterInternalQueues(paged.Data), nil
+	return paged.Data, nil
 }
 
 func filterInternalQueues(in []QueueStat) []QueueStat {
