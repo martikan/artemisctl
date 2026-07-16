@@ -27,6 +27,13 @@ type QueueStat struct {
 	DeliveringCount int64  `json:"deliveringCount,string"`
 	ConsumerCount   int64  `json:"consumerCount,string"`
 	Paused          bool   `json:"paused,string"`
+
+	// Temporary and Internal are the broker's own classification of the queue.
+	// They are how ListQueues recognises queues that are not the user's data
+	// (dynamic reply queues, internal bookkeeping) without having to guess from
+	// the name.
+	Temporary bool `json:"temporary,string"`
+	Internal  bool `json:"internalQueue,string"`
 }
 
 // DeliverableNow reports how many of the queue's messages the broker would
@@ -150,17 +157,39 @@ func (c *Client) PurgeQueue(ctx context.Context, name string) (int64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("purge %s: %w", name, err)
 	}
-	// The reply value is the removed count, encoded as a JSON array holding a
-	// single number ("[12]"), matching the other management replies' shape.
+	return parseCountReply(reply), nil
+}
+
+// CountMessages returns how many messages a scan of the queue actually finds.
+//
+// This is NOT the same as QueueStat.MessageCount. MessageCount is a counter the
+// broker maintains (for a paged queue, derived from page-counter journal
+// records); countMessages walks the queue itself. When the two disagree, the
+// counter has drifted and reports messages that do not exist -- a queue that
+// advertises a large depth, refuses to deliver anything, and can never be
+// drained. Comparing the two is the only way to tell that apart from a broker
+// that genuinely holds messages but has stalled.
+func (c *Client) CountMessages(ctx context.Context, name string) (int64, error) {
+	reply, err := c.callManagement(ctx, "queue."+name, "countMessages", "[]")
+	if err != nil {
+		return 0, fmt.Errorf("count messages on %s: %w", name, err)
+	}
+	return parseCountReply(reply), nil
+}
+
+// parseCountReply decodes the count-shaped management reply the broker returns
+// for countMessages and removeAllMessages: a JSON array holding a single number,
+// encoded as a string ("[12]").
+func parseCountReply(reply *amqp.Message) int64 {
 	raw, ok := reply.Value.(string)
 	if !ok {
-		return 0, nil
+		return 0
 	}
 	var outer []int64
 	if err := json.Unmarshal([]byte(raw), &outer); err != nil || len(outer) == 0 {
-		return 0, nil
+		return 0
 	}
-	return outer[0], nil
+	return outer[0]
 }
 
 func parseQueueStatsReply(reply *amqp.Message) ([]QueueStat, error) {
@@ -195,10 +224,22 @@ func parseQueueStatsRaw(reply *amqp.Message) ([]QueueStat, error) {
 	return paged.Data, nil
 }
 
+// filterInternalQueues drops the queues an export has no business draining:
+// the broker's own internal and temporary queues (including the dynamic reply
+// queue callManagement opens for every management call).
+//
+// It trusts the broker's temporary/internalQueue flags rather than the shape of
+// the name. An earlier version also skipped every 36-character name to catch
+// UUID-named reply queues, which silently excluded any real user queue whose
+// name happened to be 36 characters long -- an export that quietly skips a
+// queue is exactly the kind of silent data loss this tool exists to prevent.
 func filterInternalQueues(in []QueueStat) []QueueStat {
 	var out []QueueStat
 	for _, q := range in {
-		if strings.HasPrefix(q.Name, "activemq.") || strings.HasPrefix(q.Name, "$") || len(q.Name) == 36 {
+		if q.Temporary || q.Internal {
+			continue
+		}
+		if strings.HasPrefix(q.Name, "activemq.") || strings.HasPrefix(q.Name, "$") {
 			continue
 		}
 		out = append(out, q)

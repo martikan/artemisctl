@@ -143,7 +143,62 @@ func TestPartialDrainErrorMessage(t *testing.T) {
 				Drained: 3,
 				Stat:    QueueStat{Name: "orders", MessageCount: 9},
 			},
-			wants: []string{"the broker stopped delivering them"},
+			// No counter explains the remainder, so the message must name the
+			// broker-side stall and point somewhere, not just say it gave up.
+			wants: []string{"all 9 are deliverable now", "broker-side stall", "check the broker log"},
+		},
+		{
+			// The counter advertises a backlog a scan cannot find: the messages
+			// are not stuck, they are not there. Must not read as a stall.
+			name: "counter drift: scan finds nothing the counter promised",
+			err: &PartialDrainError{
+				Queue:   "DLQ",
+				Drained: 0,
+				Stat:    QueueStat{Name: "DLQ", MessageCount: 158782},
+				Scanned: true,
+				Counted: 0,
+			},
+			wants: []string{
+				"messageCount reports 158782 but a countMessages scan finds 0",
+				"counter has drifted",
+				"do not exist",
+				"restart the broker",
+			},
+		},
+		{
+			name: "scan confirms the backlog is real: broker is stalled",
+			err: &PartialDrainError{
+				Queue:   "DLQ",
+				Drained: 0,
+				Stat:    QueueStat{Name: "DLQ", MessageCount: 158782},
+				Scanned: true,
+				Counted: 158782,
+			},
+			wants: []string{"a scan confirms 158782 real message(s)", "broker-side stall"},
+		},
+		{
+			// The scan itself failed, so Counted says nothing: fall back to the
+			// plain stall wording rather than claim drift on a zero value.
+			name: "no scan ran: falls back to the stall wording",
+			err: &PartialDrainError{
+				Queue:   "DLQ",
+				Drained: 0,
+				Stat:    QueueStat{Name: "DLQ", MessageCount: 9},
+				Scanned: false,
+			},
+			wants: []string{"all 9 are deliverable now", "broker-side stall"},
+		},
+		{
+			// A real reason always wins over the scan-derived wording.
+			name: "scheduled remainder still reports the counter reason",
+			err: &PartialDrainError{
+				Queue:   "orders",
+				Drained: 2,
+				Stat:    QueueStat{Name: "orders", MessageCount: 5, ScheduledCount: 5},
+				Scanned: true,
+				Counted: 5,
+			},
+			wants: []string{"5 scheduled for later delivery"},
 		},
 	}
 	for _, tc := range tests {

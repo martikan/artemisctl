@@ -40,6 +40,35 @@ func TestCommandsAgainstBroker(t *testing.T) {
 		if !strings.Contains(out, "orders") {
 			t.Fatalf("status output missing queue: %q", out)
 		}
+		// A depth alone cannot explain why an export leaves messages behind;
+		// these columns are what let an operator tell "the broker is holding
+		// them back" from "the broker is stalled".
+		for _, col := range []string{"MESSAGE COUNT", "DELIVERABLE", "SCHEDULED", "DELIVERING", "CONSUMERS", "PAUSED"} {
+			if !strings.Contains(out, col) {
+				t.Fatalf("status output missing the %q column: %q", col, out)
+			}
+		}
+	})
+
+	// The broker under test is healthy, so --verify must come back clean and
+	// exit 0. The flag exists to single out a queue whose counter lies; one that
+	// flags a healthy broker would just be noise an operator learns to ignore.
+	t.Run("status --verify on a healthy broker", func(t *testing.T) {
+		out, err := run(t, "status", "--verify")
+		if err != nil {
+			t.Fatalf("status --verify on a healthy broker: %v\n%s", err, out)
+		}
+		for _, col := range []string{"COUNTER", "SCANNED", "MISSING", "VERDICT"} {
+			if !strings.Contains(out, col) {
+				t.Fatalf("status --verify output missing the %q column: %q", col, out)
+			}
+		}
+		if !strings.Contains(out, "orders") {
+			t.Fatalf("status --verify output missing queue: %q", out)
+		}
+		if strings.Contains(out, "DRIFT") {
+			t.Fatalf("status --verify reported drift on a healthy broker: %q", out)
+		}
 	})
 
 	t.Run("health", func(t *testing.T) {

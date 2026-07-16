@@ -29,6 +29,17 @@ type PartialDrainError struct {
 	Queue   string
 	Drained int
 	Stat    QueueStat
+
+	// Scanned reports whether a countMessages scan ran; Counted is what it
+	// found. Stat.MessageCount is only a counter, so when a scan finds 0 while
+	// the counter reports a backlog, the counter has drifted and the
+	// "remaining" messages do not exist -- no drain can ever retrieve them, and
+	// saying so is the difference between a broker bug and a tool bug.
+	//
+	// Scanned gates Counted so that the zero value means "no scan ran" rather
+	// than the far more alarming "a scan found nothing".
+	Scanned bool
+	Counted int64
 }
 
 
@@ -65,7 +76,28 @@ func (e *PartialDrainError) Error() string {
 	if e.Stat.Paused {
 		reasons = append(reasons, "queue is paused")
 	}
-	why := "the broker stopped delivering them"
+	// With no counter to explain the remainder, the broker is telling us these
+	// messages ARE deliverable yet handing over none of them -- a broker-side
+	// stall, not a queue holding messages back. Say exactly that: "the broker
+	// stopped delivering them" reads like a tool giving up, and leaves the
+	// operator with nowhere to look.
+	why := fmt.Sprintf("all %d are deliverable now, but the broker handed over none across %d retries"+
+		"; this is a broker-side stall, not a queue holding them back -- check the broker log and its disk",
+		e.Stat.DeliverableNow(), maxFruitlessPasses)
+	if e.Scanned && e.Counted == 0 && e.Stat.MessageCount > 0 {
+		// The counter advertises a backlog that a scan of the queue cannot
+		// find. Nothing is recoverable here and no retry will help: say so
+		// plainly rather than let it read as an export that failed.
+		why = fmt.Sprintf("messageCount reports %d but a countMessages scan finds 0"+
+			": the queue's message counter has drifted and those messages do not exist"+
+			" -- nothing is left to export; restart the broker to rebuild the counter from its journal",
+			e.Stat.MessageCount)
+	} else if e.Scanned && e.Counted > 0 && len(reasons) == 0 {
+		why = fmt.Sprintf("a scan confirms %d real message(s) and all are deliverable now,"+
+			" yet the broker handed over none across %d retries"+
+			": this is a broker-side stall -- check the broker log and its disk",
+			e.Counted, maxFruitlessPasses)
+	}
 	if len(reasons) > 0 {
 		why = strings.Join(reasons, ", ")
 	}
@@ -122,7 +154,14 @@ func (c *Client) DrainQueue(ctx context.Context, queue string, sink RecordSink, 
 		case drainRetry:
 			continue
 		default:
-			return total, &PartialDrainError{Queue: queue, Drained: total, Stat: stat}
+			// Only now, on the failure path, pay for a scan: countMessages
+			// walks the queue, so it is far more expensive than the counter
+			// read above and is worth it exactly once, to say WHY.
+			pde := &PartialDrainError{Queue: queue, Drained: total, Stat: stat}
+			if n, cErr := c.CountMessages(ctx, queue); cErr == nil {
+				pde.Scanned, pde.Counted = true, n
+			}
+			return total, pde
 		}
 	}
 }

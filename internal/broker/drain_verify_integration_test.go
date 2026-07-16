@@ -191,6 +191,56 @@ func TestQueueStatByNameReportsCounters(t *testing.T) {
 	}
 }
 
+// TestCountMessagesScansTheQueue pins CountMessages against a real broker.
+// Unlike QueueStat.MessageCount it walks the queue rather than reading a
+// counter, which is what lets a stalled drain tell a real backlog apart from a
+// drifted counter advertising messages that do not exist.
+func TestCountMessagesScansTheQueue(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skip integration in -short")
+	}
+	props := startArtemis(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	c, err := Connect(ctx, props)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close(ctx)
+
+	queue := benchQueue("count-scan")
+	defer func() { _, _ = c.PurgeQueue(context.Background(), queue) }()
+
+	if _, err := c.Produce(ctx, queue, GenerateMessages(12, 128, nil), 0, 1, nil); err != nil {
+		t.Fatalf("produce: %v", err)
+	}
+	// Scheduled messages are still messages on the queue: the scan counts them
+	// even though a consumer cannot receive them yet.
+	later := GenerateMessages(3, 128, nil)
+	scheduleAt(later, time.Now().Add(time.Hour))
+	if _, err := c.Produce(ctx, queue, later, 0, 1, nil); err != nil {
+		t.Fatalf("produce scheduled: %v", err)
+	}
+
+	got, err := c.CountMessages(ctx, queue)
+	if err != nil {
+		t.Fatalf("CountMessages: %v", err)
+	}
+	if got != 15 {
+		t.Fatalf("CountMessages = %d, want 15", got)
+	}
+	// The whole point is that the scan agrees with the counter on a healthy
+	// queue; only then does a disagreement mean drift.
+	stat, err := c.QueueStatByName(ctx, queue)
+	if err != nil {
+		t.Fatalf("QueueStatByName: %v", err)
+	}
+	if stat.MessageCount != got {
+		t.Fatalf("scan found %d but messageCount reports %d on a healthy queue", got, stat.MessageCount)
+	}
+}
+
 // TestQueueStatByNameMissingQueue pins the not-found path, which DrainQueue
 // treats as "the queue was auto-deleted once emptied", not as a failure.
 func TestQueueStatByNameMissingQueue(t *testing.T) {
