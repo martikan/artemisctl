@@ -7,7 +7,7 @@ COVERAGE_FILE=coverage.out
 # Linker flags to strip debug information
 LDFLAGS=-ldflags="-s -w"
 
-.PHONY: all build clean test coverage release help it-clean fixtures
+.PHONY: all build clean fmt vet test coverage release help it-clean fixtures
 
 # Name of the shared, reused integration-test broker container.
 IT_BROKER=artemisctl-it-broker
@@ -22,12 +22,20 @@ build:
 	go build -o $(BUILD_DIR)/$(BINARY_NAME) $(MAIN_PATH)
 	@echo "==> Done. Binary is in $(BUILD_DIR)/$(BINARY_NAME)"
 
-## test: Run all tests (including our Testcontainers broker tests)
-test:
-	@echo "==> Running linting..."
+## fmt: Format every Go file in the module (gofmt -s, in place)
+fmt:
+	@echo "==> Formatting..."
 	gofmt -s -w .
+	@echo "==> Done."
+
+## vet: Run go vet over the whole module
+vet:
 	@echo "==> Running go vet..."
 	go vet ./...
+	@echo "==> Done."
+
+## test: Run all tests (including our Testcontainers broker tests)
+test: fmt vet
 	@echo "==> Running tests..."
 	go test -v -p 1 ./internal/...
 
@@ -86,7 +94,9 @@ help:
 	@echo ""
 	@echo "Targets:"
 	@echo "  build    - Compile the CLI for your current operating system"
-	@echo "  test     - Run all tests"
+	@echo "  fmt      - Format every Go file (gofmt -s -w)"
+	@echo "  vet      - Run go vet over the whole module"
+	@echo "  test     - Format, vet, then run all tests"
 	@echo "  coverage - Run tests with coverage and generate an HTML report"
 	@echo "  release  - Cross-compile the CLI for Linux, macOS, and Windows"
 	@echo "  fixtures - Regenerate internal/journal/testdata from a live 2.42 container"

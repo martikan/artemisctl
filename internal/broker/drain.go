@@ -42,7 +42,6 @@ type PartialDrainError struct {
 	Counted int64
 }
 
-
 // outcome is what the broker's counters say about a finished drain pass.
 type outcome int
 
@@ -165,7 +164,6 @@ func (c *Client) DrainQueue(ctx context.Context, queue string, sink RecordSink, 
 		}
 	}
 }
-
 
 // drainOutcome decides what a pass means, given the broker's counters
 // afterwards and how many consecutive passes have now come back empty
