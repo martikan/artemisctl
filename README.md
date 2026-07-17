@@ -1,3 +1,5 @@
+[![CI/CD](https://github.com/martikan/artemisctl/actions/workflows/ci-cd.yml/badge.svg)](https://github.com/martikan/artemisctl/actions/workflows/ci-cd.yml)
+[![Release](https://img.shields.io/github/v/release/martikan/artemisctl)](https://github.com/martikan/artemisctl/releases/latest)
 [![codecov](https://codecov.io/gh/martikan/artemisctl/branch/main/graph/badge.svg?token=RL2Z3Y7CLV)](https://codecov.io/gh/martikan/artemisctl)
 
 # artemisctl
