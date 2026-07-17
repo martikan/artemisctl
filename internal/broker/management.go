@@ -160,6 +160,21 @@ func (c *Client) PurgeQueue(ctx context.Context, name string) (int64, error) {
 	return parseCountReply(reply), nil
 }
 
+// DestroyQueue removes a queue entirely -- both any messages still on it and
+// the queue definition itself -- via the broker.destroyQueue management op. The
+// two trailing arguments are removeConsumers=true (detach any attached
+// consumers first) and autoDeleteAddress=true (also remove the backing address
+// once its last queue is gone). Unlike PurgeQueue, which empties a queue but
+// leaves it in place, this shrinks the broker's queue list; auto-create
+// settings recreate the queue on the next send if a later caller needs it.
+func (c *Client) DestroyQueue(ctx context.Context, name string) error {
+	_, err := c.callManagement(ctx, "broker", "destroyQueue", fmt.Sprintf("[%q, true, true]", name))
+	if err != nil {
+		return fmt.Errorf("destroy %s: %w", name, err)
+	}
+	return nil
+}
+
 // CountMessages returns how many messages a scan of the queue actually finds.
 //
 // This is NOT the same as QueueStat.MessageCount. MessageCount is a counter the

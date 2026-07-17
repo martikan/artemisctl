@@ -10,7 +10,6 @@ import (
 	"github.com/Azure/go-amqp"
 	"github.com/martikan/artemisctl/internal/broker"
 	"github.com/martikan/artemisctl/internal/brokertest"
-	"github.com/martikan/artemisctl/internal/store"
 )
 
 // startArtemisForCLI returns connection props for the shared integration broker,
@@ -22,12 +21,6 @@ func startArtemisForCLI(t *testing.T) broker.ConnectionProps {
 	resetBrokerForCLI(t, props)
 	return props
 }
-
-// discardSink drops every drained record; used only to purge queues.
-type discardSink struct{}
-
-func (discardSink) Append(store.Record) error { return nil }
-func (discardSink) Sync() error               { return nil }
 
 // resetBrokerForCLI empties the shared broker before a CLI integration test,
 // mirroring the broker package's resetBroker over the exported client API.
@@ -47,8 +40,25 @@ func resetBrokerForCLI(t *testing.T, props broker.ConnectionProps) {
 		t.Fatalf("reset list queues: %v", err)
 	}
 	for _, q := range qs {
-		if _, err := c.DrainQueue(ctx, q.Name, discardSink{}, 500*time.Millisecond, 200); err != nil {
-			t.Fatalf("reset drain %s: %v", q.Name, err)
+		// Destroy user queues outright rather than draining or merely purging
+		// them, matching the broker package's resetBroker. A drain pays a
+		// per-queue idle-timeout even on an empty queue; a purge is instant but
+		// leaves the queue in place, so it still accumulates on the shared,
+		// never-terminated broker -- and every later `export`/DrainAll then
+		// visits each leftover queue and pays ITS drain-timeout, which is what
+		// actually dominated the CLI suite's runtime. Destroying keeps the
+		// broker's queue list minimal so DrainAll stays cheap; auto-create
+		// settings recreate a queue on the next send. DLQ/ExpiryQueue are broker
+		// infrastructure (targets of the DLA/expiry address settings), so they
+		// are only emptied, never destroyed.
+		if q.Name == "DLQ" || q.Name == "ExpiryQueue" {
+			if _, err := c.PurgeQueue(ctx, q.Name); err != nil {
+				t.Fatalf("reset purge %s: %v", q.Name, err)
+			}
+			continue
+		}
+		if err := c.DestroyQueue(ctx, q.Name); err != nil {
+			t.Fatalf("reset destroy %s: %v", q.Name, err)
 		}
 	}
 }

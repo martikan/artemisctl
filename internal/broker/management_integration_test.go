@@ -77,13 +77,23 @@ func resetBroker(t testing.TB, props ConnectionProps) {
 		t.Fatalf("reset list queues: %v", err)
 	}
 	for _, q := range qs {
-		// Purge rather than drain: removeAllMessages also clears messages a
-		// consumer cannot receive (scheduled, held for redelivery), which a
-		// drain leaves behind -- and which DrainQueue now correctly reports as
-		// an incomplete drain, so a single leftover scheduled message from an
-		// earlier test would fail every later one.
-		if _, err := c.PurgeQueue(ctx, q.Name); err != nil {
-			t.Fatalf("reset purge %s: %v", q.Name, err)
+		// Destroy user queues outright rather than draining or merely purging.
+		// A drain pays a per-queue idle-timeout and leaves scheduled/redelivery
+		// messages behind; a purge is instant but leaves the empty queue in
+		// place, so it accumulates on the shared, never-terminated broker and
+		// every later DrainAll-style call (drain-everything tests, the CLI
+		// suite's `export`) then visits it and pays its drain-timeout. Destroying
+		// keeps the broker's queue list minimal; auto-create settings recreate a
+		// queue on the next send. DLQ/ExpiryQueue are broker infrastructure
+		// (targets of the DLA/expiry address settings), so they are only emptied.
+		if q.Name == "DLQ" || q.Name == "ExpiryQueue" {
+			if _, err := c.PurgeQueue(ctx, q.Name); err != nil {
+				t.Fatalf("reset purge %s: %v", q.Name, err)
+			}
+			continue
+		}
+		if err := c.DestroyQueue(ctx, q.Name); err != nil {
+			t.Fatalf("reset destroy %s: %v", q.Name, err)
 		}
 	}
 }
