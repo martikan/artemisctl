@@ -2,7 +2,7 @@
 BINARY_NAME=artemisctl
 MAIN_PATH=./cmd/artemisctl/main.go
 BUILD_DIR=./bin
-COVERAGE_FILE=coverage.out
+COVERAGE_FILE=coverage.txt
 
 # Linker flags to strip debug information
 LDFLAGS=-ldflags="-s -w"
