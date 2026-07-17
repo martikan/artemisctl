@@ -228,3 +228,23 @@ func TestAppendRejectsOverlongQueueName(t *testing.T) {
 		t.Fatalf("expected error for over-length queue name, got nil")
 	}
 }
+
+// TestWriterCloseErrorOnClosedFile forces Close's flush-error branch by closing
+// the underlying file out from under the Writer: the buffered header can then no
+// longer be flushed. (TestSyncAfterCloseErrors already covers Sync's branch, but
+// only after a clean Close, so Close's own error path is otherwise unexercised.)
+func TestWriterCloseErrorOnClosedFile(t *testing.T) {
+	w, err := NewWriter(filepath.Join(t.TempDir(), "s.artx"))
+	if err != nil {
+		t.Fatalf("new writer: %v", err)
+	}
+	if err := w.f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Sync(); err == nil {
+		t.Error("Sync on a closed file = nil, want flush error")
+	}
+	if err := w.Close(); err == nil {
+		t.Error("Close on a closed file = nil, want flush error")
+	}
+}
