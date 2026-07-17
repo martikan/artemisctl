@@ -77,8 +77,13 @@ func resetBroker(t testing.TB, props ConnectionProps) {
 		t.Fatalf("reset list queues: %v", err)
 	}
 	for _, q := range qs {
-		if _, err := c.DrainQueue(ctx, q.Name, discardSink{}, 500*time.Millisecond, 200); err != nil {
-			t.Fatalf("reset drain %s: %v", q.Name, err)
+		// Purge rather than drain: removeAllMessages also clears messages a
+		// consumer cannot receive (scheduled, held for redelivery), which a
+		// drain leaves behind -- and which DrainQueue now correctly reports as
+		// an incomplete drain, so a single leftover scheduled message from an
+		// earlier test would fail every later one.
+		if _, err := c.PurgeQueue(ctx, q.Name); err != nil {
+			t.Fatalf("reset purge %s: %v", q.Name, err)
 		}
 	}
 }

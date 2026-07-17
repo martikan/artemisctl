@@ -48,22 +48,32 @@ func newExportCmd() *cobra.Command {
 				return fmt.Errorf("remove stale checkpoint: %w", err)
 			}
 
-			total, err := c.DrainAll(ctx, w, drainTimeout, batch, func(q string, n int) {
+			total, drainErr := c.DrainAll(ctx, w, drainTimeout, batch, func(q string, n int) {
 				fmt.Fprintf(cmd.OutOrStdout(), "drained %d from %s\n", n, q)
 			})
-			if err != nil {
+			// Whatever was drained is worth keeping even when the drain did not
+			// complete, so fsync before reporting either way.
+			syncErr := w.Sync()
+			if drainErr == nil && syncErr != nil {
+				return syncErr
+			}
+			if drainErr != nil {
 				// SIGINT: drained records are already fsync'd; report a clean
 				// interruption rather than a crash. Re-running export needs a
 				// fresh --out path (an existing non-empty store is refused).
-				if errors.Is(err, context.Canceled) {
-					_ = w.Sync()
+				if errors.Is(drainErr, context.Canceled) {
 					fmt.Fprintf(cmd.OutOrStdout(), "interrupted after %d messages, progress saved to %s\n", total, out)
-					return err
+					return drainErr
 				}
-				return err
-			}
-			if err := w.Sync(); err != nil {
-				return err
+				var pde *broker.PartialDrainError
+				if errors.As(drainErr, &pde) {
+					// The store holds real, replayable messages -- it is just
+					// not the whole queue. Say so on stdout so the count is not
+					// mistaken for a complete export, and still fail: exporting
+					// a subset while exiting 0 is how messages get lost.
+					fmt.Fprintf(cmd.OutOrStdout(), "INCOMPLETE: saved %d messages to %s, but the broker still holds messages\n", total, out)
+				}
+				return drainErr
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "exported %d messages to %s\n", total, out)
 			return nil

@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -266,8 +267,17 @@ func TestSalvageE2E(t *testing.T) {
 	dctx, dcancel := context.WithTimeout(context.Background(), 60*time.Second)
 	n, err := c.DrainQueue(dctx, redirectQueue, sink, 1*time.Second, 200)
 	dcancel()
-	if err != nil {
-		t.Fatalf("DrainQueue: %v", err)
+	// The scheduled record stays on the queue, so this drain is by definition
+	// incomplete and DrainQueue must say so rather than return nil: a drain
+	// that leaves messages behind while reporting success is what let an export
+	// silently ship a partial store. The rest of the queue must still have been
+	// drained in full.
+	var pde *broker.PartialDrainError
+	if !errors.As(err, &pde) {
+		t.Fatalf("DrainQueue err = %v, want *PartialDrainError for the undrainable scheduled record", err)
+	}
+	if pde.Stat.MessageCount != 1 || pde.Stat.ScheduledCount != 1 {
+		t.Fatalf("DrainQueue reported %+v, want exactly 1 remaining, scheduled", pde.Stat)
 	}
 	if n != wantDrainable {
 		t.Fatalf("DrainQueue drained %d messages, want %d (%d total minus the not-yet-due scheduled record, which cannot be drained until 2100-01-01)",

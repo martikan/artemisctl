@@ -79,11 +79,23 @@ func TestFilterInternalQueues(t *testing.T) {
 		{Name: "orders", MessageCount: 5},
 		{Name: "activemq.notifications", MessageCount: 1},
 		{Name: "$sys.foo", MessageCount: 1},
-		{Name: "123e4567-e89b-12d3-a456-426614174000", MessageCount: 1}, // 36 chars
+		// The dynamic reply queue callManagement opens: the broker flags it
+		// temporary, which is what we filter on.
+		{Name: "123e4567-e89b-12d3-a456-426614174000", MessageCount: 1, Temporary: true},
+		{Name: "internal.bookkeeping", MessageCount: 1, Internal: true},
+		// A real user queue that is 36 characters long must survive: an export
+		// that silently skips a queue loses every message on it.
+		{Name: "billing_credit_approved_debit_rows_q", MessageCount: 7},
 		{Name: "payments", MessageCount: 2},
 	}
 	got := filterInternalQueues(in)
-	if len(got) != 2 || got[0].Name != "orders" || got[1].Name != "payments" {
-		t.Fatalf("unexpected filter result: %+v", got)
+	want := []string{"orders", "billing_credit_approved_debit_rows_q", "payments"}
+	if len(got) != len(want) {
+		t.Fatalf("filterInternalQueues returned %d queues, want %d: %+v", len(got), len(want), got)
+	}
+	for i, w := range want {
+		if got[i].Name != w {
+			t.Fatalf("filterInternalQueues()[%d] = %q, want %q", i, got[i].Name, w)
+		}
 	}
 }
