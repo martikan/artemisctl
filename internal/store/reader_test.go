@@ -114,3 +114,48 @@ func TestReaderRejectsBogusLengthPrefix(t *testing.T) {
 		t.Fatal("Next() did not return promptly; likely attempted an oversized allocation")
 	}
 }
+
+// TestReaderDetectsCRCMismatch flips a byte inside a record body while leaving
+// the length prefix and stored CRC intact, so Next must reject it on the CRC
+// check rather than decode a silently corrupted record.
+func TestReaderDetectsCRCMismatch(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "s.artx")
+	writeRecords(t, path, []Record{{UUID: [16]byte{1}, Queue: "orders", DrainedAt: 10, AMQP: []byte("hello")}})
+
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Body begins after the 5-byte header + 4-byte length prefix (offset 9).
+	// Flip a body byte; the trailing CRC still matches the original body.
+	b[9] ^= 0xFF
+	if err := os.WriteFile(path, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	r, err := OpenReader(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if _, _, err := r.Next(); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("want ErrCorrupt on CRC mismatch, got %v", err)
+	}
+}
+
+// TestSeekToErrorOnClosedFile exercises SeekTo's seek-error branch: seeking a
+// closed file fails.
+func TestSeekToErrorOnClosedFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "s.artx")
+	writeRecords(t, path, []Record{{UUID: [16]byte{1}, Queue: "orders", DrainedAt: 10, AMQP: []byte("hello")}})
+	r, err := OpenReader(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.SeekTo(headerLen); err == nil {
+		t.Fatal("SeekTo on a closed reader = nil, want seek error")
+	}
+}

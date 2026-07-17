@@ -77,13 +77,23 @@ func resetBroker(t testing.TB, props ConnectionProps) {
 		t.Fatalf("reset list queues: %v", err)
 	}
 	for _, q := range qs {
-		// Purge rather than drain: removeAllMessages also clears messages a
-		// consumer cannot receive (scheduled, held for redelivery), which a
-		// drain leaves behind -- and which DrainQueue now correctly reports as
-		// an incomplete drain, so a single leftover scheduled message from an
-		// earlier test would fail every later one.
-		if _, err := c.PurgeQueue(ctx, q.Name); err != nil {
-			t.Fatalf("reset purge %s: %v", q.Name, err)
+		// Destroy user queues outright rather than draining or merely purging.
+		// A drain pays a per-queue idle-timeout and leaves scheduled/redelivery
+		// messages behind; a purge is instant but leaves the empty queue in
+		// place, so it accumulates on the shared, never-terminated broker and
+		// every later DrainAll-style call (drain-everything tests, the CLI
+		// suite's `export`) then visits it and pays its drain-timeout. Destroying
+		// keeps the broker's queue list minimal; auto-create settings recreate a
+		// queue on the next send. DLQ/ExpiryQueue are broker infrastructure
+		// (targets of the DLA/expiry address settings), so they are only emptied.
+		if q.Name == "DLQ" || q.Name == "ExpiryQueue" {
+			if _, err := c.PurgeQueue(ctx, q.Name); err != nil {
+				t.Fatalf("reset purge %s: %v", q.Name, err)
+			}
+			continue
+		}
+		if err := c.DestroyQueue(ctx, q.Name); err != nil {
+			t.Fatalf("reset destroy %s: %v", q.Name, err)
 		}
 	}
 }
@@ -125,5 +135,26 @@ func TestListQueuesIntegration(t *testing.T) {
 	}
 	if found.MessageCount < 2 {
 		t.Fatalf("expected MessageCount >= 2 for %q, got %d", "orders", found.MessageCount)
+	}
+}
+
+// TestDestroyQueueNonexistentErrors exercises DestroyQueue's error branch: the
+// broker rejects destroyQueue for a queue that does not exist, so the call must
+// surface an error rather than report success.
+func TestDestroyQueueNonexistentErrors(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skip integration in -short")
+	}
+	props := startArtemis(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	c, err := Connect(ctx, props)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close(ctx)
+
+	if err := c.DestroyQueue(ctx, "no-such-queue-ever"); err == nil {
+		t.Fatal("DestroyQueue on a nonexistent queue = nil, want broker error")
 	}
 }

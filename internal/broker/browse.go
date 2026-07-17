@@ -116,6 +116,16 @@ func (c *Client) queueCount(ctx context.Context, queue string) (int, error) {
 	if !ok {
 		return 0, fmt.Errorf("unexpected listMessagesAsJSON reply type %T", reply.Value)
 	}
+	return parseListMessagesCount(s)
+}
+
+// parseListMessagesCount decodes the double-encoded listMessagesAsJSON reply
+// body (an outer []string of length 1 wrapping the real JSON array of message
+// metadata) and returns how many messages it describes. Only the count is
+// used; the per-message fields are deliberately not trusted (see queueCount and
+// the package comment). Split out from queueCount so its parse/error branches
+// are unit-testable without a live broker.
+func parseListMessagesCount(s string) (int, error) {
 	var outer []string
 	if err := json.Unmarshal([]byte(s), &outer); err != nil {
 		return 0, fmt.Errorf("parse outer array: %w", err)

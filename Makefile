@@ -7,7 +7,7 @@ COVERAGE_FILE=coverage.txt
 # Linker flags to strip debug information
 LDFLAGS=-ldflags="-s -w"
 
-.PHONY: all build clean fmt vet test coverage release help it-clean fixtures
+.PHONY: all build clean fmt vet test test-short coverage release help it-clean fixtures
 
 # Name of the shared, reused integration-test broker container.
 IT_BROKER=artemisctl-it-broker
@@ -38,6 +38,16 @@ vet:
 test: fmt vet
 	@echo "==> Running tests..."
 	go test -v -p 1 ./internal/...
+
+## test-short: Run only the fast unit tests (skips every broker integration test)
+# Every integration test is gated behind testing.Short(), so -short skips them
+# all and no broker container is booted. Packages run in parallel (no -p 1,
+# which is only needed to serialize access to the shared integration broker),
+# so this is the quick inner-loop check while iterating. CI still runs the full
+# `make coverage-ci` suite for the complete coverage profile.
+test-short: fmt vet
+	@echo "==> Running fast unit tests (-short, no broker)..."
+	go test -short -race ./internal/...
 
 ## coverage: Run tests with coverage for CI
 coverage-ci:
@@ -97,6 +107,7 @@ help:
 	@echo "  fmt      - Format every Go file (gofmt -s -w)"
 	@echo "  vet      - Run go vet over the whole module"
 	@echo "  test     - Format, vet, then run all tests"
+	@echo "  test-short - Format, vet, then run only fast unit tests (no broker)"
 	@echo "  coverage - Run tests with coverage and generate an HTML report"
 	@echo "  release  - Cross-compile the CLI for Linux, macOS, and Windows"
 	@echo "  fixtures - Regenerate internal/journal/testdata from a live 2.42 container"
