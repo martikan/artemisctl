@@ -1,3 +1,5 @@
+[![codecov](https://codecov.io/gh/martikan/artemisctl/branch/main/graph/badge.svg?token=RL2Z3Y7CLV)](https://codecov.io/gh/martikan/artemisctl)
+
 # artemisctl
 
 A command-line tool for managing and recovering Apache ActiveMQ Artemis
