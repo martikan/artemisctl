@@ -137,3 +137,24 @@ func TestListQueuesIntegration(t *testing.T) {
 		t.Fatalf("expected MessageCount >= 2 for %q, got %d", "orders", found.MessageCount)
 	}
 }
+
+// TestDestroyQueueNonexistentErrors exercises DestroyQueue's error branch: the
+// broker rejects destroyQueue for a queue that does not exist, so the call must
+// surface an error rather than report success.
+func TestDestroyQueueNonexistentErrors(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skip integration in -short")
+	}
+	props := startArtemis(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	c, err := Connect(ctx, props)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close(ctx)
+
+	if err := c.DestroyQueue(ctx, "no-such-queue-ever"); err == nil {
+		t.Fatal("DestroyQueue on a nonexistent queue = nil, want broker error")
+	}
+}
